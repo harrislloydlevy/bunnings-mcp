@@ -9,17 +9,34 @@ import urllib.request
 import uuid
 from typing import Any
 
-from .auth import get_guest_token, clear_token, try_refresh_user_token
+from .auth import (
+    get_guest_token,
+    clear_token,
+    refresh_user_token_with_reason,
+    session_error_status,
+)
 from .config import APIGEE_CLIENT_ID, DEFAULT_USER_AGENT, REQUEST_TIMEOUT, CountryConfig
 
 
 class BunningsAPIError(Exception):
-    """Raised when a Bunnings API call fails."""
+    """Raised when a Bunnings API call fails.
 
-    def __init__(self, message: str, status_code: int | None = None, response_body: str = ""):
+    ``code`` is an optional machine-readable discriminator (e.g.
+    ``"refresh_token_rejected"`` when an authenticated call failed and the
+    session could not be renewed).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        response_body: str = "",
+        code: str | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
         self.response_body = response_body
+        self.code = code
 
 
 def _build_url(cfg: CountryConfig, path_or_url: str) -> str:
@@ -98,12 +115,22 @@ def api_request(
                 extra_headers=extra_headers,
             )
         if e.code in (401, 403) and retry_auth and user_token:
-            new_token = try_refresh_user_token(cfg, user_token)
+            new_token, reason = refresh_user_token_with_reason(cfg)
             if new_token:
                 return api_request(
                     cfg, path, method, body, referer_path, new_token, retry_auth=False,
                     extra_headers=extra_headers,
                 )
+            if reason:
+                # The stored session could not be renewed. Surface *why* (e.g.
+                # the refresh chain was rotated elsewhere) instead of a raw 401.
+                info = session_error_status(reason)
+                raise BunningsAPIError(
+                    info["error"],
+                    status_code=e.code,
+                    response_body=raw,
+                    code=info["error_code"],
+                ) from e
         raise BunningsAPIError(
             f"HTTP {e.code} from {url}: {raw[:500]}",
             status_code=e.code,

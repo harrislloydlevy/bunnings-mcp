@@ -131,19 +131,59 @@ The web app performs the same refresh grant (or an equivalent BFF exchange) in t
 background, rotating the cookie on each cycle. The browser works purely because it keeps
 refreshing — not because requests themselves extend the session.
 
-### WARNING — cookie chain conflicts
-If the browser and MCP share the **same** refresh chain, rotation conflicts (one side's
-token goes stale → that side gets logged out). Log in via an **incognito/private window**,
-copy the cookies, then **close the window** so the MCP owns the chain exclusively.
+### WARNING — cookie chain conflicts (rotating refresh token + shared login)
+
+The refresh token is **single-use and rotates on every use**; only the newest value works.
+If two clients share the **same** login, each one's rotation invalidates the other's stored
+token and the loser gets `invalid_grant` → logged out. This is *the* failure mode to design
+around, and it is asymmetric — whoever refreshes last wins.
+
+The cookies given to the MCP must therefore come from an **isolated login that will not be
+used interactively afterwards**:
+
+1. Log in in an **incognito/private window** (or a separate browser profile), including MFA.
+2. Copy `UserAuthentication` + `UserAuthenticationRefresh`.
+3. **Close the window** and do not use that session again — then call `complete_login`.
+
+Copying from an everyday tab you keep browsing with will work briefly and then break.
+Note that using the MCP itself does not conflict: it is *one* holder of the chain (it
+persists each rotated token immediately under a cross-process lock).
+
+#### How the code detects a dead chain
+`_refresh_token_grant()` now distinguishes the token endpoint's response:
+
+- `invalid_grant` → **the chain was consumed elsewhere** (the shared/rotated case above).
+- `network_error` / `http_<code>` → transient or unexpected; the session is **kept**, not cleared.
+
+An `invalid_grant` marks the cached session (`refresh_rejected`) instead of silently deleting
+it, so later calls return a stable error code + hint rather than a bare "not logged in":
+
+| `error_code` | Cause |
+|--------------|-------|
+| `refresh_token_rejected` | Refresh token already rotated elsewhere (the shared-login case) |
+| `access_expired_no_refresh` | Access token expired, no refresh cookie stored |
+| `refresh_unreachable` | Token endpoint unreachable (transient; session kept intact) |
+| `not_logged_in` | No cached session |
+| `refresh_failed` / `refreshed_token_rejected` | Refresh rejected / renewed session failed validation |
+
+Also fixed: `_read_cached_user_token()` was subtracting `TOKEN_REFRESH_SKEW` twice (once when
+writing `cache_expires_at`, again when reading), which gave the ~10-minute access token a
+**zero-second** cache window and forced a refresh (and rotation) on *every* authenticated call.
+That needless rotation made shared-chain conflicts arrive almost immediately.
 
 ### Implementation (in `bunnings_mcp/auth.py`)
 1. `set_user_token(cfg, user_token, refresh_token)` — validates via the **wishlist API**
    (not `/apis/auth/session`, which 404s server-side) and caches both tokens.
-2. `get_user_token(cfg)` — returns the cached access token; if expired, transparently
-   calls `refresh_user_token()` and returns the renewed one.
-3. `refresh_user_token(cfg)` — performs the grant above and persists the rotated pair.
-4. `get_user_refresh_token(cfg)` — exposes whether auto-renewal is enabled.
-5. `client.api_request()` still retries on 401/403 as a safety net.
+2. `get_user_token(cfg)` — returns a valid cached access token; if expired, transparently
+   refreshes and returns the renewed one. Delegates to `user_session_status()`, which also
+   reports *why* there is no token (never-logged-in vs dead chain vs network error).
+3. `refresh_user_token(cfg)` / `refresh_user_token_with_reason(cfg)` — perform the grant above
+   and persist the rotated pair; the latter also returns a failure reason.
+4. `session_error_status(reason)` — maps a failure reason to the customer-facing
+   `{error_code, error, hint}` dict used by the tools.
+5. `get_user_refresh_token(cfg)` — exposes whether auto-renewal is enabled.
+6. `client.api_request()` retries on 401/403; if the refresh fails it raises
+   `BunningsAPIError` carrying the same `error_code` instead of a raw 401.
 
 ## Failed Approaches (don't retry these)
 

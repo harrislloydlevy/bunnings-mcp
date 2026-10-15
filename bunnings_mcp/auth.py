@@ -45,7 +45,11 @@ def _read_cached_token(cfg: CountryConfig) -> str | None:
             cached = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
-    if float(cached.get("cache_expires_at") or 0) <= time.time() + TOKEN_REFRESH_SKEW:
+    # cache_expires_at already includes TOKEN_REFRESH_SKEW (see
+    # _write_cached_token/_write_cached_user_token), so compare against now —
+    # subtracting the skew again here would make short-lived tokens look stale
+    # immediately and force a needless rotation on every call.
+    if float(cached.get("cache_expires_at") or 0) <= time.time():
         return None
     return str(cached.get("token") or "") or None
 
@@ -171,7 +175,8 @@ def _read_user_credentials(cfg: CountryConfig) -> dict[str, Any]:
 
 def _read_cached_user_token(cfg: CountryConfig) -> str | None:
     cached = _read_user_credentials(cfg)
-    if float(cached.get("cache_expires_at") or 0) <= time.time() + TOKEN_REFRESH_SKEW:
+    # cache_expires_at already includes TOKEN_REFRESH_SKEW, so compare to now.
+    if float(cached.get("cache_expires_at") or 0) <= time.time():
         return None
     return str(cached.get("token") or "") or None
 
@@ -208,6 +213,96 @@ def _clear_cached_user_token(cfg: CountryConfig) -> None:
         os.unlink(_user_token_cache_path(cfg))
     except OSError:
         pass
+
+
+# Machine-readable session-failure reasons (see user_session_status / session_error_status).
+SESSION_REFRESH_REJECTED = "refresh_token_rejected"
+SESSION_UNREACHABLE = "refresh_unreachable"
+
+_REFRESH_REJECTED_MESSAGE = (
+    "The stored session can no longer be renewed: Bunnings rejected the "
+    "UserAuthenticationRefresh cookie because it had already been used. Bunnings "
+    "rotates that cookie on EVERY use and only the newest value works, so this "
+    "almost always means the same login was also being used elsewhere — most "
+    "likely the browser tab the cookies were copied from."
+)
+
+_REFRESH_REJECTED_HINT = (
+    "Log in again from an ISOLATED session: use a private/incognito window or a "
+    "separate browser profile, copy the UserAuthentication and "
+    "UserAuthenticationRefresh cookies, then CLOSE that window and do not use it "
+    "again before calling complete_login. Cookies copied from a tab you keep "
+    "browsing with will keep going stale."
+)
+
+
+def _mark_refresh_rejected(cfg: CountryConfig) -> None:
+    """Flag the cached session as having a dead refresh chain.
+
+    A rotating refresh token is single-use, so an ``invalid_grant`` rejection
+    means the chain was consumed elsewhere. We keep the refresh token (it is the
+    evidence) and set ``refresh_rejected`` so :func:`user_session_status` can
+    report the precise reason rather than a generic "not logged in".
+    """
+    path = _user_token_cache_path(cfg)
+    cached = _read_user_credentials(cfg)
+    cached["refresh_rejected"] = True
+    cached["refresh_rejected_at"] = time.time()
+    for key in ("token", "real_expires_at", "cache_expires_at"):
+        cached.pop(key, None)
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cached, f)
+    except OSError:
+        pass
+
+
+def session_error_status(reason: str | None) -> dict[str, Any]:
+    """Map a session-failure reason to a client-facing error dict.
+
+    Accepts both the high-level reasons from :func:`user_session_status`
+    (``"refresh_token_rejected"`` etc.) and the low-level reasons from
+    :func:`refresh_user_token_with_reason` / :func:`_refresh_locked`
+    (``"invalid_grant"``, ``"network_error"``, ``"no_refresh_token"`` ...).
+
+    ``error_code`` is the stable, machine-readable discriminator callers should
+    branch on; ``error`` is a human-readable message; ``hint`` (when present) is
+    the corrective action to show the user.
+    """
+    if reason in (SESSION_REFRESH_REJECTED, "invalid_grant"):
+        return {
+            "error_code": SESSION_REFRESH_REJECTED,
+            "error": _REFRESH_REJECTED_MESSAGE,
+            "hint": _REFRESH_REJECTED_HINT,
+        }
+    if reason in ("access_expired_no_refresh", "no_refresh_token"):
+        return {
+            "error_code": "access_expired_no_refresh",
+            "error": (
+                "The cached access token has expired and no refresh cookie was "
+                "stored, so the session cannot be renewed."
+            ),
+            "hint": (
+                "Call login, then complete_login with BOTH cookies "
+                "(UserAuthentication and UserAuthenticationRefresh)."
+            ),
+        }
+    if reason in (SESSION_UNREACHABLE, "network_error") or (
+        reason or ""
+    ).startswith("http_"):
+        return {
+            "error_code": SESSION_UNREACHABLE,
+            "error": "Could not reach the Bunnings token endpoint to renew the session.",
+            "hint": (
+                "This is usually a transient network issue — retry shortly. "
+                "The stored session was left intact."
+            ),
+        }
+    return {
+        "error_code": "not_logged_in",
+        "error": "Not logged in. Call the login tool first to authenticate.",
+    }
 
 
 @contextlib.contextmanager
@@ -346,13 +441,33 @@ def exchange_login_code(
     }
 
 
+def _oauth_error_code(detail: str) -> str:
+    """Extract the OAuth ``error`` code from a token-endpoint error body."""
+    try:
+        payload = json.loads(detail)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if isinstance(payload, dict):
+        return str(payload.get("error") or "")
+    return ""
+
+
 def _refresh_token_grant(
     cfg: CountryConfig, refresh_token: str, timeout: int = 30
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, str | None]:
     """Perform the OIDC refresh_token grant against the IdentityServer.
 
-    Returns the raw token payload (access_token, refresh_token, expires_in, ...)
-    or None if the grant was rejected / failed. Does NOT touch the cache.
+    Returns ``(payload, None)`` on success, or ``(None, reason)`` on failure.
+    ``reason`` is one of:
+
+    * ``"invalid_grant"`` — the IdentityServer rejected the refresh token. The
+      refresh token rotates on every use and only the newest value is valid, so
+      this almost always means the same login chain was consumed elsewhere (the
+      browser tab it was copied from, or another client).
+    * ``"network_error"`` — the token endpoint could not be reached.
+    * ``"http_<code>"`` — an unexpected HTTP status.
+
+    Never raises. Does NOT touch the cache.
     """
     body = urllib.parse.urlencode({
         "grant_type": "refresh_token",
@@ -372,30 +487,47 @@ def _refresh_token_grant(
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             payload = json.loads(resp.read().decode("utf-8", "replace"))
-    except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError):
-        return None
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")
+        if _oauth_error_code(detail) == "invalid_grant":
+            return None, "invalid_grant"
+        return None, f"http_{e.code}"
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None, "network_error"
+    except json.JSONDecodeError:
+        return None, "network_error"
     if not isinstance(payload, dict) or not payload.get("access_token"):
-        return None
-    return payload
+        return None, "invalid_response"
+    return payload, None
 
 
-def _refresh_locked(cfg: CountryConfig, force: bool = False) -> str | None:
+def _refresh_locked(cfg: CountryConfig, force: bool = False) -> tuple[str | None, str | None]:
     """Refresh the access token under the cross-process lock.
 
     Re-checks the cache inside the lock (unless ``force``) so concurrent callers
     reuse one rotation. Persists the rotated pair immediately.
+
+    Returns ``(access_token, None)`` on success, or ``(None, reason)`` where
+    ``reason`` is ``"invalid_grant"`` (the refresh chain is dead — expired,
+    revoked, or already rotated by another client), ``"no_refresh_token"``,
+    ``"network_error"`` or ``"http_<code>"``.
     """
     with _user_token_lock(cfg):
         if not force:
             cached = _read_cached_user_token(cfg)
             if cached:
-                return cached
+                return cached, None
         refresh_token = get_user_refresh_token(cfg)
         if not refresh_token:
-            return None
-        payload = _refresh_token_grant(cfg, refresh_token)
+            return None, "no_refresh_token"
+        payload, error = _refresh_token_grant(cfg, refresh_token)
         if not payload:
-            return None
+            if error == "invalid_grant":
+                # The refresh chain is dead. Remember why (without discarding the
+                # cache) so later calls can hand the user an actionable message
+                # instead of a bare "not logged in".
+                _mark_refresh_rejected(cfg)
+            return None, error or "invalid_response"
         new_token = str(payload["access_token"])
         expires_in = int(payload.get("expires_in") or 600)
         _write_cached_user_token(
@@ -404,7 +536,59 @@ def _refresh_locked(cfg: CountryConfig, force: bool = False) -> str | None:
             expires_in,
             refresh_token=str(payload.get("refresh_token") or refresh_token),
         )
-        return new_token
+        return new_token, None
+
+
+def refresh_user_token_with_reason(cfg: CountryConfig) -> tuple[str | None, str | None]:
+    """Refresh the access token and also report *why* it failed.
+
+    Returns ``(access_token, None)`` on success, else ``(None, reason)`` where
+    ``reason`` is one of ``"invalid_grant"`` (the refresh chain is dead — the
+    rotating token was consumed elsewhere), ``"no_refresh_token"``,
+    ``"network_error"`` or ``"http_<code>"``.
+    """
+    return _refresh_locked(cfg, force=True)
+
+
+def user_session_status(cfg: CountryConfig) -> tuple[str | None, str | None]:
+    """Return ``(access_token, reason)`` for the cached user session.
+
+    ``reason`` is ``None`` when a usable token is available; otherwise it is a
+    machine-readable code explaining the failure:
+
+    * ``"not_logged_in"`` — no credentials cached at all.
+    * ``"access_expired_no_refresh"`` — an access token was cached but has
+      expired and no refresh cookie was stored, so it cannot be renewed.
+    * ``"refresh_token_rejected"`` — the IdentityServer rejected the stored
+      refresh token. Because the refresh token rotates on every use and only the
+      newest value works, this almost always means the same login was also used
+      elsewhere (e.g. the browser tab the cookies were copied from).
+    * ``"refresh_unreachable"`` — the token endpoint could not be reached
+      (transient); the cached credentials are deliberately left intact.
+
+    The cached credentials are never silently discarded here, so
+    :func:`session_error_status` can explain what happened on a later call.
+    """
+    cached_token = _read_cached_user_token(cfg)
+    if cached_token:
+        return cached_token, None
+    creds = _read_user_credentials(cfg)
+    refresh_token = str(creds.get("refresh_token") or "")
+    if not refresh_token:
+        if creds.get("token"):
+            return None, "access_expired_no_refresh"
+        return None, "not_logged_in"
+    if creds.get("refresh_rejected"):
+        return None, SESSION_REFRESH_REJECTED
+    refreshed, error = _refresh_locked(cfg)
+    if refreshed:
+        return refreshed, None
+    if error == "invalid_grant":
+        return None, SESSION_REFRESH_REJECTED
+    if error == "no_refresh_token":
+        return None, "access_expired_no_refresh"
+    # Network / server hiccup: do NOT clear the session, just report it.
+    return None, SESSION_UNREACHABLE
 
 
 def get_user_token(cfg: CountryConfig) -> str | None:
@@ -414,20 +598,12 @@ def get_user_token(cfg: CountryConfig) -> str | None:
     re-checks the cache inside it, so parallel callers reuse a single rotation
     instead of racing to spend the same single-use refresh token.
 
-    Returns None only if there is no session at all (not logged in), or the
-    refresh chain has been revoked/expired.
+    Returns None if there is no usable session. Use :func:`user_session_status`
+    to distinguish "never logged in" from a dead refresh chain or a transient
+    network error.
     """
-    cached_token = _read_cached_user_token(cfg)
-    if cached_token:
-        return cached_token
-    # Cached access token expired — try to renew via the refresh token chain
-    if get_user_refresh_token(cfg):
-        refreshed = _refresh_locked(cfg)
-        if refreshed:
-            return refreshed
-        # Refresh chain is dead — clear stale caches
-        _clear_cached_user_token(cfg)
-    return None
+    token, _ = user_session_status(cfg)
+    return token
 
 
 def _decode_jwt_expiry(token: str) -> int:
@@ -516,12 +692,33 @@ def set_user_token(
         # The access cookie is dead. If we were handed a refresh cookie, renew
         # now rather than bouncing the user.
         if not refresh_token:
-            return {"error": "Invalid or expired token", "logged_in": False, "country": cfg.label}
+            return {
+                "error": (
+                    "The UserAuthentication cookie was rejected by Bunnings (it looks "
+                    "expired or invalid) and no UserAuthenticationRefresh cookie was "
+                    "supplied."
+                ),
+                "error_code": "access_token_rejected",
+                "logged_in": False,
+                "country": cfg.label,
+            }
         with _user_token_lock(cfg):
-            grant = _refresh_token_grant(cfg, refresh_token)
+            grant, error = _refresh_token_grant(cfg, refresh_token)
             if not grant:
+                if error == "invalid_grant":
+                    # The refresh cookie was already spent — the classic symptom of
+                    # copying cookies from a login that is still being used.
+                    return {
+                        **session_error_status(SESSION_REFRESH_REJECTED),
+                        "logged_in": False,
+                        "country": cfg.label,
+                    }
                 return {
-                    "error": "Access token expired and refresh token rejected",
+                    "error": (
+                        "The access cookie was expired and the refresh cookie could not "
+                        f"be used ({error or 'unknown error'})."
+                    ),
+                    "error_code": "refresh_failed",
                     "logged_in": False,
                     "country": cfg.label,
                 }
@@ -535,13 +732,19 @@ def set_user_token(
             status, payload = _validate_user_token(cfg, user_token, guest_token)
             if status != "ok":
                 return {
-                    "error": "Refreshed token was rejected",
+                    "error": "The refreshed session was rejected by Bunnings.",
+                    "error_code": "refreshed_token_rejected",
                     "logged_in": False,
                     "country": cfg.label,
                 }
             refreshed_on_login = True
     elif status == "network_error":
-        return {"error": "Could not validate token", "logged_in": False, "country": cfg.label}
+        return {
+            "error": "Could not reach Bunnings to validate the cookie (network error).",
+            "error_code": "validation_unreachable",
+            "logged_in": False,
+            "country": cfg.label,
+        }
     # "other_error" (e.g. 5xx): the token may still be valid; cache it and let
     # auto-refresh reconcile later.
 
@@ -574,7 +777,8 @@ def refresh_user_token(cfg: CountryConfig) -> str | None:
 
     Returns the new access token, or None if the refresh chain is dead.
     """
-    return _refresh_locked(cfg, force=True)
+    token, _ = _refresh_locked(cfg, force=True)
+    return token
 
 
 def try_refresh_user_token(cfg: CountryConfig, user_token: str | None = None) -> str | None:

@@ -12,7 +12,9 @@ from .auth import (
     get_country_config,
     get_user_token,
     refresh_user_token,
+    session_error_status,
     set_user_token,
+    user_session_status,
 )
 from . import client
 from .client import BunningsAPIError
@@ -27,9 +29,14 @@ mcp = FastMCP(
     Product search, details, pricing, stock, and store locations are available
     without authentication using the guest token flow.
     
-    Cart and shopping list management require an authenticated user token.
-    To get a user token, log in to the Bunnings website and extract the
-    bearer token from your session.
+    Cart and shopping list management require an authenticated user session.
+    Call the `login` tool for one-time setup instructions, then `complete_login`
+    with the UserAuthentication and UserAuthenticationRefresh cookie values.
+
+    IMPORTANT: those cookies must come from an ISOLATED login (a private/incognito
+    window or separate browser profile) that you stop using afterwards. Bunnings
+    rotates the refresh cookie on every use and only the newest value works, so
+    sharing the login with a browser you keep using makes the session go stale.
     """,
 )
 
@@ -429,7 +436,7 @@ async def list_stores(
             "stores": stores[:limit],
         }
     except BunningsAPIError as e:
-        return {"error": str(e), "country": cfg.label}
+        return _api_error(cfg, e)
 
 
 # =============================================================================
@@ -458,14 +465,24 @@ async def login(
     cfg = get_country_config(country)
     return {
         "country": cfg.label,
+        "important": (
+            "The cookies MUST come from an isolated login that you will not use "
+            "interactively afterwards. Bunnings rotates the refresh cookie on every "
+            "use and only the newest value works — if the browser you copy from keeps "
+            "using the same session, the credentials you hand the server will go stale "
+            "and the server will be logged out."
+        ),
         "instructions": (
-            "1. Log in at https://www.bunnings.com.au (or bunnings.co.nz) in your browser.\n"
-            "   Tip: use a private/incognito window so the session chain is only used here.\n"
-            "2. Open DevTools (F12) → Application → Storage → Cookies → the bunnings domain.\n"
-            "3. Copy the value of the 'UserAuthentication' cookie.\n"
-            "4. Copy the value of the 'UserAuthenticationRefresh' cookie as well.\n"
-            "5. Call complete_login with both values.\n"
-            "   The refresh cookie enables automatic renewal — no repeated logins needed."
+            "1. Open a private/incognito window (or a separate browser profile) and log "
+            "in at https://www.bunnings.com.au (or bunnings.co.nz), including MFA.\n"
+            "2. With that window still open, open DevTools (F12) → Application → "
+            "Storage → Cookies → the Bunnings domain.\n"
+            "3. Copy the value of the 'UserAuthentication' cookie (a JWT starting 'eyJ').\n"
+            "4. Copy the value of the 'UserAuthenticationRefresh' cookie (64 hex chars "
+            "ending in '-1').\n"
+            "5. CLOSE the private/incognito window and stop using that session.\n"
+            "6. Call complete_login with both values.\n"
+            "The refresh cookie enables automatic renewal — no repeated logins needed."
         ),
         "cookie_names": ["UserAuthentication", "UserAuthenticationRefresh"],
     }
@@ -499,6 +516,15 @@ async def complete_login(
             warning = (
                 "No refresh_token provided — the session will expire in ~10 minutes. "
                 "Provide the UserAuthenticationRefresh cookie to enable automatic renewal."
+            )
+        elif result.get("refreshed_on_login"):
+            warning = (
+                "The UserAuthentication cookie you supplied had already expired and was "
+                "renewed from the refresh cookie. That is expected if you copied the "
+                "cookies a few minutes late, but it can also happen when the login is "
+                "still being used elsewhere. Make sure you copied from an ISOLATED "
+                "session (private/incognito window or a separate browser profile) and "
+                "have closed it."
             )
         return {**result, "warning": warning}
     return result
@@ -536,20 +562,27 @@ async def check_login_status(
     from .auth import get_user_refresh_token
 
     cfg = get_country_config(country)
-    token = get_user_token(cfg)
+    token, reason = user_session_status(cfg)
     has_refresh = bool(get_user_refresh_token(cfg))
-    return {
+    renews = has_refresh and reason != "refresh_token_rejected"
+    result: dict[str, Any] = {
         "country": cfg.label,
         "logged_in": token is not None,
-        "auto_renewal_enabled": has_refresh,
-        "note": (
+        "auto_renewal_enabled": renews,
+    }
+    if token is None:
+        info = session_error_status(reason)
+        result["note"] = info["error"]
+        result["error_code"] = info["error_code"]
+        if info.get("hint"):
+            result["hint"] = info["hint"]
+    else:
+        result["note"] = (
             "Session renews automatically via refresh token."
             if has_refresh
             else "No refresh token stored — session expires in ~10 minutes."
-            if token
-            else "Not logged in. Call login for instructions."
-        ),
-    }
+        )
+    return result
 
 
 # =============================================================================
@@ -557,14 +590,41 @@ async def check_login_status(
 # =============================================================================
 
 
-def _get_user_token_or_error(cfg, country: str) -> tuple[str | None, dict[str, Any] | None]:
+def _api_error(cfg, exc: "BunningsAPIError") -> dict[str, Any]:
+    """Build a tool error dict, preserving the machine-readable error code."""
+    result: dict[str, Any] = {"error": str(exc), "country": cfg.label}
+    code = getattr(exc, "code", None)
+    if code:
+        result["error_code"] = code
+    return result
+
+
+def _session_error(cfg, reason: str | None) -> dict[str, Any]:
+    """Build a not-logged-in / dead-session tool error dict.
+
+    ``error_code`` lets callers branch on the cause; ``hint`` (when present) is
+    the corrective action to show the user.
+    """
+    return {**session_error_status(reason), "country": cfg.label}
+
+
+def _get_user_token_or_error(
+    cfg, user_token: str | None = None
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Resolve a user token for an authenticated tool, or return an error dict.
+
+    Uses the (patchable) module-level :func:`get_user_token`; when that yields
+    nothing, consults :func:`user_session_status` so the caller learns whether
+    they were never logged in or the refresh chain has gone stale (the usual
+    symptom of the cookies also being used by a live browser session).
+    """
+    if user_token:
+        return user_token, None
     token = get_user_token(cfg)
     if token:
         return token, None
-    return None, {
-        "error": "Not logged in. Call the login tool first to authenticate.",
-        "country": cfg.label,
-    }
+    _, reason = user_session_status(cfg)
+    return None, _session_error(cfg, reason)
 
 
 @mcp.tool()
@@ -584,14 +644,14 @@ async def get_cart(
         Current cart contents with items, quantities, and totals.
     """
     cfg = get_country_config(country)
-    token = user_token or get_user_token(cfg)
-    if not token:
-        return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
+    token, session_error = _get_user_token_or_error(cfg, user_token)
+    if session_error:
+        return session_error
     try:
         cart = client.get_cart(cfg, token)
         return {"country": cfg.label, "cart": cart}
     except BunningsAPIError as e:
-        return {"error": str(e), "country": cfg.label}
+        return _api_error(cfg, e)
 
 
 @mcp.tool()
@@ -615,14 +675,14 @@ async def add_to_cart(
         Updated cart contents.
     """
     cfg = get_country_config(country)
-    token = user_token or get_user_token(cfg)
-    if not token:
-        return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
+    token, session_error = _get_user_token_or_error(cfg, user_token)
+    if session_error:
+        return session_error
     try:
         cart = client.add_to_cart(cfg, token, item_number, quantity)
         return {"country": cfg.label, "cart": cart}
     except BunningsAPIError as e:
-        return {"error": str(e), "country": cfg.label}
+        return _api_error(cfg, e)
 
 
 @mcp.tool()
@@ -646,14 +706,14 @@ async def update_cart_item(
         Updated cart contents.
     """
     cfg = get_country_config(country)
-    token = user_token or get_user_token(cfg)
-    if not token:
-        return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
+    token, session_error = _get_user_token_or_error(cfg, user_token)
+    if session_error:
+        return session_error
     try:
         cart = client.update_cart_item(cfg, token, entry_number, quantity)
         return {"country": cfg.label, "cart": cart}
     except BunningsAPIError as e:
-        return {"error": str(e), "country": cfg.label}
+        return _api_error(cfg, e)
 
 
 @mcp.tool()
@@ -675,14 +735,14 @@ async def remove_from_cart(
         Updated cart contents.
     """
     cfg = get_country_config(country)
-    token = user_token or get_user_token(cfg)
-    if not token:
-        return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
+    token, session_error = _get_user_token_or_error(cfg, user_token)
+    if session_error:
+        return session_error
     try:
         cart = client.remove_from_cart(cfg, token, entry_number)
         return {"country": cfg.label, "cart": cart}
     except BunningsAPIError as e:
-        return {"error": str(e), "country": cfg.label}
+        return _api_error(cfg, e)
 
 
 # =============================================================================
@@ -707,14 +767,14 @@ async def list_shopping_lists(
         List of shopping/project lists.
     """
     cfg = get_country_config(country)
-    token = user_token or get_user_token(cfg)
-    if not token:
-        return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
+    token, session_error = _get_user_token_or_error(cfg, user_token)
+    if session_error:
+        return session_error
     try:
         lists = client.list_shopping_lists(cfg, token)
         return {"country": cfg.label, "lists": lists}
     except BunningsAPIError as e:
-        return {"error": str(e), "country": cfg.label}
+        return _api_error(cfg, e)
 
 
 @mcp.tool()
@@ -736,14 +796,14 @@ async def create_shopping_list(
         The newly created list.
     """
     cfg = get_country_config(country)
-    token = user_token or get_user_token(cfg)
-    if not token:
-        return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
+    token, session_error = _get_user_token_or_error(cfg, user_token)
+    if session_error:
+        return session_error
     try:
         new_list = client.create_shopping_list(cfg, token, name)
         return {"country": cfg.label, "list": new_list}
     except BunningsAPIError as e:
-        return {"error": str(e), "country": cfg.label}
+        return _api_error(cfg, e)
 
 
 @mcp.tool()
@@ -765,14 +825,14 @@ async def get_shopping_list(
         The shopping list with its items.
     """
     cfg = get_country_config(country)
-    token = user_token or get_user_token(cfg)
-    if not token:
-        return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
+    token, session_error = _get_user_token_or_error(cfg, user_token)
+    if session_error:
+        return session_error
     try:
         shopping_list = client.get_shopping_list(cfg, token, list_id)
         return {"country": cfg.label, "list": shopping_list}
     except BunningsAPIError as e:
-        return {"error": str(e), "country": cfg.label}
+        return _api_error(cfg, e)
 
 
 @mcp.tool()
@@ -798,14 +858,14 @@ async def add_to_shopping_list(
         Updated shopping list.
     """
     cfg = get_country_config(country)
-    token = user_token or get_user_token(cfg)
-    if not token:
-        return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
+    token, session_error = _get_user_token_or_error(cfg, user_token)
+    if session_error:
+        return session_error
     try:
         updated = client.add_to_shopping_list(cfg, token, list_id, item_number, quantity)
         return {"country": cfg.label, "list": updated}
     except BunningsAPIError as e:
-        return {"error": str(e), "country": cfg.label}
+        return _api_error(cfg, e)
 
 
 @mcp.tool()
@@ -835,9 +895,9 @@ async def remove_from_shopping_list(
         Confirmation with the removed entry id(s).
     """
     cfg = get_country_config(country)
-    token = user_token or get_user_token(cfg)
-    if not token:
-        return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
+    token, session_error = _get_user_token_or_error(cfg, user_token)
+    if session_error:
+        return session_error
     if not wishlist_entry_id and not item_number:
         return {"error": "Provide either item_number or wishlist_entry_id.", "country": cfg.label}
     try:
@@ -854,7 +914,7 @@ async def remove_from_shopping_list(
         result = client.remove_from_shopping_list(cfg, token, list_id, eid, product_code=item_number)
         return {"country": cfg.label, "removed": eid, "result": result}
     except BunningsAPIError as e:
-        return {"error": str(e), "country": cfg.label}
+        return _api_error(cfg, e)
 
 
 @mcp.tool()
@@ -876,14 +936,14 @@ async def delete_shopping_list(
         Deletion confirmation.
     """
     cfg = get_country_config(country)
-    token = user_token or get_user_token(cfg)
-    if not token:
-        return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
+    token, session_error = _get_user_token_or_error(cfg, user_token)
+    if session_error:
+        return session_error
     try:
         result = client.delete_shopping_list(cfg, token, list_id)
         return {"country": cfg.label, "deleted": True, "result": result}
     except BunningsAPIError as e:
-        return {"error": str(e), "country": cfg.label}
+        return _api_error(cfg, e)
 
 
 @mcp.tool()
@@ -907,14 +967,14 @@ async def rename_shopping_list(
         The updated list.
     """
     cfg = get_country_config(country)
-    token = user_token or get_user_token(cfg)
-    if not token:
-        return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
+    token, session_error = _get_user_token_or_error(cfg, user_token)
+    if session_error:
+        return session_error
     try:
         updated = client.rename_shopping_list(cfg, token, list_id, name)
         return {"country": cfg.label, "list": updated}
     except BunningsAPIError as e:
-        return {"error": str(e), "country": cfg.label}
+        return _api_error(cfg, e)
 
 
 @mcp.tool()
@@ -945,9 +1005,9 @@ async def update_shopping_list_item(
         The updated list.
     """
     cfg = get_country_config(country)
-    token = user_token or get_user_token(cfg)
-    if not token:
-        return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
+    token, session_error = _get_user_token_or_error(cfg, user_token)
+    if session_error:
+        return session_error
     if not wishlist_entry_id and not item_number:
         return {"error": "Provide either item_number or wishlist_entry_id.", "country": cfg.label}
     try:
@@ -964,7 +1024,7 @@ async def update_shopping_list_item(
         updated = client.update_shopping_list_item(cfg, token, list_id, eid, quantity)
         return {"country": cfg.label, "list": updated}
     except BunningsAPIError as e:
-        return {"error": str(e), "country": cfg.label}
+        return _api_error(cfg, e)
 
 
 @mcp.tool()
@@ -992,9 +1052,9 @@ async def move_shopping_list_items(
         Confirmation with the moved entry id(s).
     """
     cfg = get_country_config(country)
-    token = user_token or get_user_token(cfg)
-    if not token:
-        return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
+    token, session_error = _get_user_token_or_error(cfg, user_token)
+    if session_error:
+        return session_error
     if not item_numbers and not wishlist_entry_ids:
         return {"error": "Provide either item_numbers or wishlist_entry_ids.", "country": cfg.label}
     try:
@@ -1018,7 +1078,7 @@ async def move_shopping_list_items(
             "result": result,
         }
     except BunningsAPIError as e:
-        return {"error": str(e), "country": cfg.label}
+        return _api_error(cfg, e)
 
 
 @mcp.tool()
@@ -1042,14 +1102,14 @@ async def set_active_shopping_list(
         The updated lists.
     """
     cfg = get_country_config(country)
-    token = user_token or get_user_token(cfg)
-    if not token:
-        return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
+    token, session_error = _get_user_token_or_error(cfg, user_token)
+    if session_error:
+        return session_error
     try:
         result = client.set_active_shopping_list(cfg, token, list_id)
         return {"country": cfg.label, "active_list_id": list_id, "result": result}
     except BunningsAPIError as e:
-        return {"error": str(e), "country": cfg.label}
+        return _api_error(cfg, e)
 
 
 @mcp.tool()
@@ -1071,14 +1131,14 @@ async def add_shopping_list_to_cart(
         Bulk add result (``allAddedToCart`` and any ``failedItems``).
     """
     cfg = get_country_config(country)
-    token = user_token or get_user_token(cfg)
-    if not token:
-        return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
+    token, session_error = _get_user_token_or_error(cfg, user_token)
+    if session_error:
+        return session_error
     try:
         result = client.add_shopping_list_to_cart(cfg, token, list_id)
         return {"country": cfg.label, "list_id": list_id, "result": result}
     except BunningsAPIError as e:
-        return {"error": str(e), "country": cfg.label}
+        return _api_error(cfg, e)
 
 
 def main() -> None:
