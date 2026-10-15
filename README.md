@@ -72,10 +72,15 @@ docker run -p 8000:8000 bunnings-mcp
 | `create_shopping_list` | Create a new list |
 | `get_shopping_list` | Get list with items |
 | `add_to_shopping_list` | Add item to list |
-| `remove_from_shopping_list` | Remove item from list |
+| `remove_from_shopping_list` | Remove item from list (by SKU or entry id) |
+| `rename_shopping_list` | Rename a list |
+| `update_shopping_list_item` | Change an item's quantity in a list |
+| `move_shopping_list_items` | Move item(s) between lists |
+| `set_active_shopping_list` | Set the active list |
+| `add_shopping_list_to_cart` | Add every item in a list to the cart |
 | `delete_shopping_list` | Delete a list |
 
-Verified request shapes, gotchas, and the two still-unknown list endpoints:
+Verified request shapes, gotchas, and the known (unexposable) endpoints:
 [`BunningsProjectLists.md`](BunningsProjectLists.md).
 
 ## Authentication

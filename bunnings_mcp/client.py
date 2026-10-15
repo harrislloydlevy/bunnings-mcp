@@ -35,6 +35,7 @@ def _api_headers(
     token: str | None = None,
     json_body: bool = False,
     user_token: str | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> dict[str, str]:
     token = token or get_guest_token(cfg)
     cookie = f"GuestAuthentication={token}"
@@ -60,6 +61,8 @@ def _api_headers(
     }
     if json_body:
         headers["Content-Type"] = "application/json"
+    if extra_headers:
+        headers.update(extra_headers)
     return headers
 
 
@@ -71,6 +74,7 @@ def api_request(
     referer_path: str = "/",
     user_token: str | None = None,
     retry_auth: bool = True,
+    extra_headers: dict[str, str] | None = None,
 ) -> Any:
     """Make an API request to Bunnings."""
     url = _build_url(cfg, path)
@@ -79,7 +83,7 @@ def api_request(
     req = urllib.request.Request(
         url,
         data=data,
-        headers=_api_headers(cfg, referer_path, token, body is not None, user_token),
+        headers=_api_headers(cfg, referer_path, token, body is not None, user_token, extra_headers),
         method=method,
     )
     try:
@@ -89,11 +93,17 @@ def api_request(
         raw = e.read().decode("utf-8", "replace")
         if e.code in (401, 403) and retry_auth and not user_token:
             clear_token(cfg)
-            return api_request(cfg, path, method, body, referer_path, user_token, retry_auth=False)
+            return api_request(
+                cfg, path, method, body, referer_path, user_token, retry_auth=False,
+                extra_headers=extra_headers,
+            )
         if e.code in (401, 403) and retry_auth and user_token:
             new_token = try_refresh_user_token(cfg, user_token)
             if new_token:
-                return api_request(cfg, path, method, body, referer_path, new_token, retry_auth=False)
+                return api_request(
+                    cfg, path, method, body, referer_path, new_token, retry_auth=False,
+                    extra_headers=extra_headers,
+                )
         raise BunningsAPIError(
             f"HTTP {e.code} from {url}: {raw[:500]}",
             status_code=e.code,
@@ -101,6 +111,11 @@ def api_request(
         ) from e
     except urllib.error.URLError as e:
         raise BunningsAPIError(f"Network error calling {url}: {e.reason}") from e
+
+    # Some mutation endpoints (e.g. wishlist removeEntry) return 200 with an
+    # empty body. Treat that as a successful no-content response.
+    if not raw.strip():
+        return {}
 
     try:
         payload = json.loads(raw)
@@ -417,11 +432,14 @@ def remove_from_cart(
     )
 
 
+_WISHLIST_BASE = "/_apis/v1/customer-management/users/wishlist"
+
+
 def list_shopping_lists(cfg: CountryConfig, user_token: str) -> dict[str, Any]:
     """List user's shopping/project lists. Requires authenticated user token."""
     return api_request(
         cfg,
-        "/_apis/v1/customer-management/users/wishlist?sortOrder=default&fields=SLIM",
+        f"{_WISHLIST_BASE}?sortOrder=default&fields=SLIM",
         user_token=user_token,
     )
 
@@ -430,7 +448,7 @@ def create_shopping_list(cfg: CountryConfig, user_token: str, name: str) -> dict
     """Create a new shopping/project list. Requires authenticated user token."""
     return api_request(
         cfg,
-        "/_apis/v1/customer-management/users/wishlist",
+        _WISHLIST_BASE,
         method="POST",
         body={"name": name},
         user_token=user_token,
@@ -441,51 +459,213 @@ def get_shopping_list(cfg: CountryConfig, user_token: str, list_id: str) -> dict
     """Get a specific shopping/project list. Requires authenticated user token."""
     return api_request(
         cfg,
-        f"/_apis/v1/customer-management/users/wishlist/{list_id}",
+        f"{_WISHLIST_BASE}/{list_id}",
         user_token=user_token,
     )
 
 
 def add_to_shopping_list(
-    cfg: CountryConfig, user_token: str, list_id: str, item_number: str, quantity: int = 1
+    cfg: CountryConfig,
+    user_token: str,
+    list_id: str,
+    item_number: str,
+    quantity: int = 1,
+    list_name: str | None = None,
 ) -> dict[str, Any]:
-    """Add an item to a shopping/project list. Requires authenticated user token."""
+    """Add an item to a shopping/project list. Requires authenticated user token.
+
+    The API requires a non-empty ``wishlistName`` (and ``name``); if the caller
+    does not know it, the list is fetched to discover the real name.
+    """
+    if not list_name:
+        detail = get_shopping_list(cfg, user_token, list_id)
+        list_name = (detail or {}).get("name") if isinstance(detail, dict) else None
+        list_name = list_name or "My Project List"
     return api_request(
         cfg,
-        "/_apis/v1/customer-management/users/wishlist",
+        _WISHLIST_BASE,
         method="POST",
         body={
             "code": item_number,
             "list": "",
-            "name": "My Project List",
+            "name": list_name,
             "productCategory": "",
             "productName": "",
             "productValue": 0,
             "quantity": str(quantity),
             "wishlistId": list_id,
-            "wishlistName": "My Project List",
+            "wishlistName": list_name,
         },
         user_token=user_token,
     )
 
 
-def remove_from_shopping_list(
-    cfg: CountryConfig, user_token: str, list_id: str, item_number: str
+def rename_shopping_list(
+    cfg: CountryConfig, user_token: str, list_id: str, name: str
 ) -> dict[str, Any]:
-    """Remove an item from a shopping/project list. Requires authenticated user token."""
+    """Rename a shopping/project list. Requires authenticated user token."""
     return api_request(
         cfg,
-        f"/_apis/v1/customer-management/users/wishlist/{list_id}/items/{item_number}",
+        f"{_WISHLIST_BASE}/{list_id}",
+        method="PATCH",
+        body={"name": name},
+        user_token=user_token,
+    )
+
+
+def update_shopping_list_item(
+    cfg: CountryConfig,
+    user_token: str,
+    list_id: str,
+    wishlist_entry_id: str,
+    quantity: int,
+) -> dict[str, Any]:
+    """Set the quantity of a list entry. Requires authenticated user token.
+
+    Note: this takes the entry's ``wishlistEntryId`` (from ``get_shopping_list``),
+    not the product SKU.
+    """
+    return api_request(
+        cfg,
+        f"{_WISHLIST_BASE}/{list_id}",
+        method="PATCH",
+        body={"entries": [{"quantity": str(quantity), "wishlistEntryId": str(wishlist_entry_id)}]},
+        user_token=user_token,
+    )
+
+
+def remove_from_shopping_list(
+    cfg: CountryConfig,
+    user_token: str,
+    list_id: str,
+    wishlist_entry_id: str,
+    product_code: str | None = None,
+) -> dict[str, Any]:
+    """Remove an entry from a shopping/project list. Requires authenticated user token.
+
+    Note: this takes the entry's ``wishlistEntryId`` (from ``get_shopping_list``),
+    not the product SKU. Works on a single entry; the endpoint returns an empty body.
+    """
+    entry: dict[str, Any] = {"wishlistEntryId": str(wishlist_entry_id)}
+    if product_code:
+        entry["productId"] = str(product_code)
+    return api_request(
+        cfg,
+        f"{_WISHLIST_BASE}/{list_id}/removeEntry",
         method="DELETE",
+        body={"entries": [entry]},
+        user_token=user_token,
+    )
+
+
+def move_shopping_list_items(
+    cfg: CountryConfig,
+    user_token: str,
+    target_list_id: str,
+    entries: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Move entries to another list. Requires authenticated user token.
+
+    ``entries`` is a list of ``{"wishlistEntryId": ..., "quantity": ...}``. The
+    list id in the path is the **destination**; the source is inferred from the
+    entry ids.
+    """
+    body_entries = [
+        {"quantity": str(e["quantity"]), "wishlistEntryId": str(e["wishlistEntryId"])}
+        for e in entries
+    ]
+    return api_request(
+        cfg,
+        f"{_WISHLIST_BASE}/{target_list_id}/moveProducts",
+        method="POST",
+        body={"entries": body_entries},
+        user_token=user_token,
+    )
+
+
+def set_active_shopping_list(
+    cfg: CountryConfig, user_token: str, list_id: str
+) -> dict[str, Any]:
+    """Set the active shopping/project list. Requires authenticated user token."""
+    return api_request(
+        cfg,
+        f"{_WISHLIST_BASE}/{list_id}/setActive",
+        method="POST",
+        user_token=user_token,
+    )
+
+
+def add_shopping_list_to_cart(
+    cfg: CountryConfig, user_token: str, list_id: str, cart_id: str | None = None
+) -> dict[str, Any]:
+    """Add every item in a list to the cart. Requires authenticated user token.
+
+    Uses the dedicated ``lstexp`` bulk endpoint (not the wishlist controller's
+    ``addToCart``). That endpoint requires a plain ``region`` header; sending only
+    ``X-region`` fails with ``400 "The Region field is required."``
+    """
+    detail = get_shopping_list(cfg, user_token, list_id)
+    entries = (detail or {}).get("entries") or [] if isinstance(detail, dict) else []
+    items = [
+        {"code": e["product"]["code"], "quantity": int(e.get("quantity") or 1)}
+        for e in entries
+        if isinstance(e, dict) and isinstance(e.get("product"), dict) and e["product"].get("code")
+    ]
+    if not items:
+        return {"allAddedToCart": True, "addedItems": [], "note": "List has no items."}
+    cid = _resolve_cart_id(cfg, user_token, cart_id)
+    if not cid:
+        return {"error": "Could not determine cart ID", "country": cfg.label}
+    result = api_request(
+        cfg,
+        "/_apis/lstexp/list/addToCart",
+        method="POST",
+        body={"cartId": cid, "items": items},
+        user_token=user_token,
+        extra_headers={"region": cfg.default_region},
+    )
+    if isinstance(result, dict):
+        result.setdefault("addedItems", [i["code"] for i in items])
+    return result
+
+
+def share_shopping_list(
+    cfg: CountryConfig,
+    user_token: str,
+    list_id: str,
+    captcha_response: str,
+    recipient_email: str,
+    recipient_name: str,
+) -> dict[str, Any]:
+    """Email/share a list. Requires authenticated user token.
+
+    The endpoint requires a reCAPTCHA Enterprise token (``captchaResponse``,
+    obtained in the browser) which cannot be generated server-side, so this is
+    not exposed as an MCP tool.
+    """
+    return api_request(
+        cfg,
+        f"{_WISHLIST_BASE}/{list_id}/sendEmail",
+        method="POST",
+        body={
+            "captchaResponse": captcha_response,
+            "recipientEmail": recipient_email,
+            "recipientName": recipient_name,
+        },
         user_token=user_token,
     )
 
 
 def delete_shopping_list(cfg: CountryConfig, user_token: str, list_id: str) -> dict[str, Any]:
-    """Delete a shopping/project list. Requires authenticated user token."""
+    """Delete a shopping/project list. Requires authenticated user token.
+
+    Body is the plural DTO ``{"wishLists":[{"wishlistId": <id>}]}``; a bare id
+    returns 200 with no effect.
+    """
     return api_request(
         cfg,
-        f"/_apis/v1/customer-management/users/wishlist/{list_id}",
+        f"{_WISHLIST_BASE}/removeWishlist",
         method="DELETE",
+        body={"wishLists": [{"wishlistId": list_id}]},
         user_token=user_token,
     )

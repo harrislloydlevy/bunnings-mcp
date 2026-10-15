@@ -14,26 +14,8 @@ from .auth import (
     refresh_user_token,
     set_user_token,
 )
-from .client import (
-    add_to_cart,
-    add_to_shopping_list,
-    browse_category,
-    create_shopping_list,
-    delete_shopping_list,
-    get_cart,
-    get_product_detail,
-    get_product_fulfillment,
-    get_product_location,
-    get_product_price,
-    get_shopping_list,
-    list_shopping_lists,
-    list_stores,
-    remove_from_cart,
-    remove_from_shopping_list,
-    search_products,
-    update_cart_item,
-    BunningsAPIError,
-)
+from . import client
+from .client import BunningsAPIError
 
 mcp = FastMCP(
     "Bunnings",
@@ -266,7 +248,7 @@ async def search_products(
     """
     cfg = get_country_config(country)
     try:
-        payload = search_products(cfg, query, limit=limit)
+        payload = client.search_products(cfg, query, limit=limit)
         products = _extract_products(payload, cfg, limit)
         return {
             "country": cfg.label,
@@ -297,7 +279,7 @@ async def get_product(
     cfg = get_country_config(country)
     sku = _sku_from_value(sku) or sku
     try:
-        data = get_product_detail(cfg, sku)
+        data = client.get_product_detail(cfg, sku)
         product = _parse_product_detail(data, cfg, sku)
         return {"country": cfg.label, "product": product}
     except BunningsAPIError as e:
@@ -321,7 +303,7 @@ async def get_product_price(
     cfg = get_country_config(country)
     sku = _sku_from_value(sku) or sku
     try:
-        price = get_product_price(cfg, sku)
+        price = client.get_product_price(cfg, sku)
         return {"country": cfg.label, "sku": sku, "price": price}
     except BunningsAPIError as e:
         return {"error": str(e), "country": cfg.label, "sku": sku}
@@ -346,7 +328,7 @@ async def get_product_stock(
     cfg = get_country_config(country)
     sku = _sku_from_value(sku) or sku
     try:
-        fulfilment = get_product_fulfillment(cfg, sku, location_code)
+        fulfilment = client.get_product_fulfillment(cfg, sku, location_code)
         return {"country": cfg.label, "sku": sku, "fulfilment": fulfilment}
     except BunningsAPIError as e:
         return {"error": str(e), "country": cfg.label, "sku": sku}
@@ -371,7 +353,7 @@ async def get_product_location(
     cfg = get_country_config(country)
     sku = _sku_from_value(sku) or sku
     try:
-        locations = get_product_location(cfg, sku, location_code)
+        locations = client.get_product_location(cfg, sku, location_code)
         return {"country": cfg.label, "sku": sku, "locations": locations}
     except BunningsAPIError as e:
         return {"error": str(e), "country": cfg.label, "sku": sku}
@@ -395,7 +377,7 @@ async def browse_category(
     """
     cfg = get_country_config(country)
     try:
-        payload = browse_category(cfg, category, limit=limit)
+        payload = client.browse_category(cfg, category, limit=limit)
         products = _extract_products(payload, cfg, limit)
         return {
             "country": cfg.label,
@@ -431,7 +413,7 @@ async def list_stores(
     """
     cfg = get_country_config(country)
     try:
-        payload = list_stores(cfg)
+        payload = client.list_stores(cfg)
         stores = _parse_stores(payload, cfg)
         if region:
             needle = region.lower().replace(" ", "")
@@ -606,7 +588,7 @@ async def get_cart(
     if not token:
         return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
     try:
-        cart = get_cart(cfg, token)
+        cart = client.get_cart(cfg, token)
         return {"country": cfg.label, "cart": cart}
     except BunningsAPIError as e:
         return {"error": str(e), "country": cfg.label}
@@ -637,7 +619,7 @@ async def add_to_cart(
     if not token:
         return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
     try:
-        cart = add_to_cart(cfg, token, item_number, quantity)
+        cart = client.add_to_cart(cfg, token, item_number, quantity)
         return {"country": cfg.label, "cart": cart}
     except BunningsAPIError as e:
         return {"error": str(e), "country": cfg.label}
@@ -668,7 +650,7 @@ async def update_cart_item(
     if not token:
         return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
     try:
-        cart = update_cart_item(cfg, token, entry_number, quantity)
+        cart = client.update_cart_item(cfg, token, entry_number, quantity)
         return {"country": cfg.label, "cart": cart}
     except BunningsAPIError as e:
         return {"error": str(e), "country": cfg.label}
@@ -697,7 +679,7 @@ async def remove_from_cart(
     if not token:
         return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
     try:
-        cart = remove_from_cart(cfg, token, entry_number)
+        cart = client.remove_from_cart(cfg, token, entry_number)
         return {"country": cfg.label, "cart": cart}
     except BunningsAPIError as e:
         return {"error": str(e), "country": cfg.label}
@@ -729,7 +711,7 @@ async def list_shopping_lists(
     if not token:
         return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
     try:
-        lists = list_shopping_lists(cfg, token)
+        lists = client.list_shopping_lists(cfg, token)
         return {"country": cfg.label, "lists": lists}
     except BunningsAPIError as e:
         return {"error": str(e), "country": cfg.label}
@@ -758,7 +740,7 @@ async def create_shopping_list(
     if not token:
         return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
     try:
-        new_list = create_shopping_list(cfg, token, name)
+        new_list = client.create_shopping_list(cfg, token, name)
         return {"country": cfg.label, "list": new_list}
     except BunningsAPIError as e:
         return {"error": str(e), "country": cfg.label}
@@ -787,7 +769,7 @@ async def get_shopping_list(
     if not token:
         return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
     try:
-        shopping_list = get_shopping_list(cfg, token, list_id)
+        shopping_list = client.get_shopping_list(cfg, token, list_id)
         return {"country": cfg.label, "list": shopping_list}
     except BunningsAPIError as e:
         return {"error": str(e), "country": cfg.label}
@@ -820,7 +802,7 @@ async def add_to_shopping_list(
     if not token:
         return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
     try:
-        updated = add_to_shopping_list(cfg, token, list_id, item_number, quantity)
+        updated = client.add_to_shopping_list(cfg, token, list_id, item_number, quantity)
         return {"country": cfg.label, "list": updated}
     except BunningsAPIError as e:
         return {"error": str(e), "country": cfg.label}
@@ -829,7 +811,8 @@ async def add_to_shopping_list(
 @mcp.tool()
 async def remove_from_shopping_list(
     list_id: str,
-    item_number: str,
+    item_number: str | None = None,
+    wishlist_entry_id: str | None = None,
     country: str = "au",
     user_token: str | None = None,
 ) -> dict[str, Any]:
@@ -837,22 +820,39 @@ async def remove_from_shopping_list(
 
     Requires authentication. Use the login tool first, or provide a user_token.
 
+    Identify the entry by ``wishlist_entry_id`` (from get_shopping_list) or by
+    ``item_number`` (SKU). When only a SKU is given, the list is fetched to find
+    the entry. Note the backend identifies entries by ``wishlistEntryId``, not SKU.
+
     Args:
         list_id: The list ID
         item_number: Product item number/SKU to remove
+        wishlist_entry_id: The entry's wishlistEntryId (takes precedence over item_number)
         country: Country code - "au" for Australia, "nz" for New Zealand
         user_token: Optional bearer token (uses cached token if not provided)
 
     Returns:
-        Updated shopping list.
+        Confirmation with the removed entry id(s).
     """
     cfg = get_country_config(country)
     token = user_token or get_user_token(cfg)
     if not token:
         return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
+    if not wishlist_entry_id and not item_number:
+        return {"error": "Provide either item_number or wishlist_entry_id.", "country": cfg.label}
     try:
-        updated = remove_from_shopping_list(cfg, token, list_id, item_number)
-        return {"country": cfg.label, "list": updated}
+        eid = wishlist_entry_id
+        if not eid:
+            detail = client.get_shopping_list(cfg, token, list_id)
+            for entry in (detail.get("entries") if isinstance(detail, dict) else None) or []:
+                product = entry.get("product") or {}
+                if str(product.get("code")) == str(item_number):
+                    eid = entry.get("wishlistEntryId")
+                    break
+            if not eid:
+                return {"error": f"No entry for item {item_number} in list {list_id}.", "country": cfg.label}
+        result = client.remove_from_shopping_list(cfg, token, list_id, eid, product_code=item_number)
+        return {"country": cfg.label, "removed": eid, "result": result}
     except BunningsAPIError as e:
         return {"error": str(e), "country": cfg.label}
 
@@ -880,8 +880,203 @@ async def delete_shopping_list(
     if not token:
         return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
     try:
-        result = delete_shopping_list(cfg, token, list_id)
+        result = client.delete_shopping_list(cfg, token, list_id)
         return {"country": cfg.label, "deleted": True, "result": result}
+    except BunningsAPIError as e:
+        return {"error": str(e), "country": cfg.label}
+
+
+@mcp.tool()
+async def rename_shopping_list(
+    list_id: str,
+    name: str,
+    country: str = "au",
+    user_token: str | None = None,
+) -> dict[str, Any]:
+    """Rename a shopping/project list.
+
+    Requires authentication. Use the login tool first, or provide a user_token.
+
+    Args:
+        list_id: The list ID
+        name: New name for the list
+        country: Country code - "au" for Australia, "nz" for New Zealand
+        user_token: Optional bearer token (uses cached token if not provided)
+
+    Returns:
+        The updated list.
+    """
+    cfg = get_country_config(country)
+    token = user_token or get_user_token(cfg)
+    if not token:
+        return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
+    try:
+        updated = client.rename_shopping_list(cfg, token, list_id, name)
+        return {"country": cfg.label, "list": updated}
+    except BunningsAPIError as e:
+        return {"error": str(e), "country": cfg.label}
+
+
+@mcp.tool()
+async def update_shopping_list_item(
+    list_id: str,
+    quantity: int,
+    wishlist_entry_id: str | None = None,
+    item_number: str | None = None,
+    country: str = "au",
+    user_token: str | None = None,
+) -> dict[str, Any]:
+    """Change the quantity of an item in a shopping/project list.
+
+    Requires authentication. Use the login tool first, or provide a user_token.
+
+    Identify the entry by ``wishlist_entry_id`` (from get_shopping_list) or by
+    ``item_number`` (SKU).
+
+    Args:
+        list_id: The list ID
+        quantity: New quantity for the entry
+        wishlist_entry_id: The entry's wishlistEntryId (takes precedence over item_number)
+        item_number: Product item number/SKU (used to find the entry when no entry id)
+        country: Country code - "au" for Australia, "nz" for New Zealand
+        user_token: Optional bearer token (uses cached token if not provided)
+
+    Returns:
+        The updated list.
+    """
+    cfg = get_country_config(country)
+    token = user_token or get_user_token(cfg)
+    if not token:
+        return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
+    if not wishlist_entry_id and not item_number:
+        return {"error": "Provide either item_number or wishlist_entry_id.", "country": cfg.label}
+    try:
+        eid = wishlist_entry_id
+        if not eid:
+            detail = client.get_shopping_list(cfg, token, list_id)
+            for entry in (detail.get("entries") if isinstance(detail, dict) else None) or []:
+                product = entry.get("product") or {}
+                if str(product.get("code")) == str(item_number):
+                    eid = entry.get("wishlistEntryId")
+                    break
+            if not eid:
+                return {"error": f"No entry for item {item_number} in list {list_id}.", "country": cfg.label}
+        updated = client.update_shopping_list_item(cfg, token, list_id, eid, quantity)
+        return {"country": cfg.label, "list": updated}
+    except BunningsAPIError as e:
+        return {"error": str(e), "country": cfg.label}
+
+
+@mcp.tool()
+async def move_shopping_list_items(
+    from_list_id: str,
+    to_list_id: str,
+    item_numbers: list[str] | None = None,
+    wishlist_entry_ids: list[str] | None = None,
+    country: str = "au",
+    user_token: str | None = None,
+) -> dict[str, Any]:
+    """Move item(s) from one shopping/project list to another.
+
+    Requires authentication. Use the login tool first, or provide a user_token.
+
+    Args:
+        from_list_id: The source list ID
+        to_list_id: The destination list ID
+        item_numbers: Product item numbers/SKUs to move (matched in the source list)
+        wishlist_entry_ids: Specific entry ids to move (alternative to item_numbers)
+        country: Country code - "au" for Australia, "nz" for New Zealand
+        user_token: Optional bearer token (uses cached token if not provided)
+
+    Returns:
+        Confirmation with the moved entry id(s).
+    """
+    cfg = get_country_config(country)
+    token = user_token or get_user_token(cfg)
+    if not token:
+        return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
+    if not item_numbers and not wishlist_entry_ids:
+        return {"error": "Provide either item_numbers or wishlist_entry_ids.", "country": cfg.label}
+    try:
+        detail = client.get_shopping_list(cfg, token, from_list_id)
+        entries = (detail.get("entries") if isinstance(detail, dict) else None) or []
+        want_ids = {str(x) for x in (wishlist_entry_ids or [])}
+        want_skus = {str(x) for x in (item_numbers or [])}
+        selected = []
+        for entry in entries:
+            product = entry.get("product") or {}
+            eid = str(entry.get("wishlistEntryId"))
+            sku = str(product.get("code"))
+            if eid in want_ids or sku in want_skus:
+                selected.append({"wishlistEntryId": eid, "quantity": entry.get("quantity") or 1})
+        if not selected:
+            return {"error": "No matching entries found in the source list.", "country": cfg.label}
+        result = client.move_shopping_list_items(cfg, token, to_list_id, selected)
+        return {
+            "country": cfg.label,
+            "moved": [s["wishlistEntryId"] for s in selected],
+            "result": result,
+        }
+    except BunningsAPIError as e:
+        return {"error": str(e), "country": cfg.label}
+
+
+@mcp.tool()
+async def set_active_shopping_list(
+    list_id: str,
+    country: str = "au",
+    user_token: str | None = None,
+) -> dict[str, Any]:
+    """Set the active shopping/project list.
+
+    Matches the "active" list used when adding new items to a list on the site.
+
+    Requires authentication. Use the login tool first, or provide a user_token.
+
+    Args:
+        list_id: The list ID to make active
+        country: Country code - "au" for Australia, "nz" for New Zealand
+        user_token: Optional bearer token (uses cached token if not provided)
+
+    Returns:
+        The updated lists.
+    """
+    cfg = get_country_config(country)
+    token = user_token or get_user_token(cfg)
+    if not token:
+        return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
+    try:
+        result = client.set_active_shopping_list(cfg, token, list_id)
+        return {"country": cfg.label, "active_list_id": list_id, "result": result}
+    except BunningsAPIError as e:
+        return {"error": str(e), "country": cfg.label}
+
+
+@mcp.tool()
+async def add_shopping_list_to_cart(
+    list_id: str,
+    country: str = "au",
+    user_token: str | None = None,
+) -> dict[str, Any]:
+    """Add every item in a shopping/project list to the shopping cart.
+
+    Requires authentication. Use the login tool first, or provide a user_token.
+
+    Args:
+        list_id: The list ID whose items should all be added to the cart
+        country: Country code - "au" for Australia, "nz" for New Zealand
+        user_token: Optional bearer token (uses cached token if not provided)
+
+    Returns:
+        Bulk add result (``allAddedToCart`` and any ``failedItems``).
+    """
+    cfg = get_country_config(country)
+    token = user_token or get_user_token(cfg)
+    if not token:
+        return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
+    try:
+        result = client.add_shopping_list_to_cart(cfg, token, list_id)
+        return {"country": cfg.label, "list_id": list_id, "result": result}
     except BunningsAPIError as e:
         return {"error": str(e), "country": cfg.label}
 
