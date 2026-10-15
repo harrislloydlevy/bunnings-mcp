@@ -118,6 +118,29 @@ Use `check_login_status` to see whether a session is active and auto-renewal is 
 
 Full auth details, findings, and failed approaches: [`BunningsAuth.md`](BunningsAuth.md).
 
+## Testing
+
+Standalone scripts (no pytest needed) that drive the real MCP server through the FastMCP
+in-memory client:
+
+| Script | Scope | Needs network + session |
+|--------|-------|--------------------------|
+| `test_mcp_suite.py` | **Live end-to-end**: exercises every tool (including optional params), verifies each mutation with a read-back MCP call, then restores all state | Yes |
+| `test_server_tools.py` | Offline regression: drives the tools via the MCP client with the API layer monkeypatched | No |
+| `test_auth_flow.py` | Auth lifecycle: login, refresh rotation, auto-refresh, process restart, negatives | Yes |
+| `test_session_refresh.py` | Manual probe of the OIDC refresh-token chain (needs fresh browser cookies) | Yes |
+
+```bash
+python3 test_server_tools.py  # 20 offline checks, no login needed
+python3 test_mcp_suite.py     # 32 live checks (drives every tool)
+```
+
+`test_mcp_suite.py` is safe to run against your real account: it creates and deletes
+throwaway project lists, adds/removes only the cart entries it creates, restores the active
+list, and backs up/restores the cached session file around the `logout` test. It prints a
+per-case PASS/FAIL report and an end-state check (cart, lists, session) and exits non-zero
+on any failure.
+
 ## API Research
 
 This server is built from:

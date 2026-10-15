@@ -56,8 +56,9 @@ The browser also sends `Referer: https://www.bunnings.com.au/my-account/project-
   in the browser HAR because the UI has no "move to list" affordance.)
 - **`removeWishlist`**: body is the plural DTO `{"wishLists":[{"wishlistId":"<id>"}]}`.
   A single `wishlistId`/`id`/array body returns 200 **with no effect** (silent no-op).
-- **Duplicate add is a no-op**: adding a SKU already in the list adds nothing and does not
-  create a second entry. Use `PATCH ... entries` to set quantity.
+- **Duplicate add is rejected**: adding a SKU already in the list fails with `BUS-4008
+  "Product already exists in the wishlist"` (HTTP 200, `statusDetails.state=FAILURE`) and
+  creates no second entry. Use `PATCH ... entries` to change quantity.
 - **Quantity** is sent as a string (`"2"`) on add and on `PATCH`.
 
 ## Add whole list to cart — the real endpoint
