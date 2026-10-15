@@ -75,6 +75,9 @@ docker run -p 8000:8000 bunnings-mcp
 | `remove_from_shopping_list` | Remove item from list |
 | `delete_shopping_list` | Delete a list |
 
+Verified request shapes, gotchas, and the two still-unknown list endpoints:
+[`BunningsProjectLists.md`](BunningsProjectLists.md).
+
 ## Authentication
 
 Product search, details, pricing, stock, and store locations use a **guest token** that is automatically minted via Bunnings' public OAuth2 flow — no login required.
@@ -126,7 +129,7 @@ This server is built from:
 - `GET /_apis/v1/item-api/locations` — Aisle/bay locations
 - `GET /_apis/v1/stores/country/{AU|NZ}?fields=FULL` — Store list
 - `/_apis/v1/basket` — Cart operations (auth required)
-- `/_apis/v1/projectlists` — Shopping/project lists (auth required)
+- `/_apis/v1/customer-management/users/wishlist` — Project lists (auth required; see [`BunningsProjectLists.md`](BunningsProjectLists.md))
 
 ## License
 
