@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import http.cookiejar
 import json
@@ -13,7 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from typing import Any
+from typing import Any, Iterator
 
 from .config import (
     APIGEE_CLIENT_ID,
@@ -209,6 +210,42 @@ def _clear_cached_user_token(cfg: CountryConfig) -> None:
         pass
 
 
+@contextlib.contextmanager
+def _user_token_lock(cfg: CountryConfig) -> Iterator[None]:
+    """Cross-process exclusive lock guarding refresh/write of the token chain.
+
+    The refresh token is single-use: if two callers refresh concurrently with
+    the same token, one rotates it and the other gets a 400, which would kill
+    the session. Serialising refresh read-modify-write around a file lock makes
+    concurrent ``get_user_token`` calls safe. Best-effort on platforms without
+    ``fcntl`` (the lock is simply a no-op there).
+    """
+    path = _user_token_cache_path(cfg) + ".lock"
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        # Cache dir not writable — proceed without locking.
+        yield
+        return
+    try:
+        try:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            pass
+        yield
+    finally:
+        try:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except (ImportError, OSError):
+            pass
+        os.close(fd)
+
+
 def get_user_refresh_token(cfg: CountryConfig) -> str | None:
     """Get the cached refresh token (for auto-refresh), or None."""
     cached = _read_user_credentials(cfg)
@@ -309,17 +346,83 @@ def exchange_login_code(
     }
 
 
+def _refresh_token_grant(
+    cfg: CountryConfig, refresh_token: str, timeout: int = 30
+) -> dict[str, Any] | None:
+    """Perform the OIDC refresh_token grant against the IdentityServer.
+
+    Returns the raw token payload (access_token, refresh_token, expires_in, ...)
+    or None if the grant was rejected / failed. Does NOT touch the cache.
+    """
+    body = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "client_id": cfg.retail_token_client_id,  # e.g. "budp_user_au_code"
+        "refresh_token": refresh_token,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        cfg.auth_base + "/connect/token",
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": DEFAULT_USER_AGENT,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "replace"))
+    except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or not payload.get("access_token"):
+        return None
+    return payload
+
+
+def _refresh_locked(cfg: CountryConfig, force: bool = False) -> str | None:
+    """Refresh the access token under the cross-process lock.
+
+    Re-checks the cache inside the lock (unless ``force``) so concurrent callers
+    reuse one rotation. Persists the rotated pair immediately.
+    """
+    with _user_token_lock(cfg):
+        if not force:
+            cached = _read_cached_user_token(cfg)
+            if cached:
+                return cached
+        refresh_token = get_user_refresh_token(cfg)
+        if not refresh_token:
+            return None
+        payload = _refresh_token_grant(cfg, refresh_token)
+        if not payload:
+            return None
+        new_token = str(payload["access_token"])
+        expires_in = int(payload.get("expires_in") or 600)
+        _write_cached_user_token(
+            cfg,
+            new_token,
+            expires_in,
+            refresh_token=str(payload.get("refresh_token") or refresh_token),
+        )
+        return new_token
+
+
 def get_user_token(cfg: CountryConfig) -> str | None:
     """Get a valid user token, auto-refreshing via the refresh token if needed.
 
-    Returns None only if there is no session at all (not logged in).
+    Safe under concurrent calls: the refresh runs under a cross-process lock and
+    re-checks the cache inside it, so parallel callers reuse a single rotation
+    instead of racing to spend the same single-use refresh token.
+
+    Returns None only if there is no session at all (not logged in), or the
+    refresh chain has been revoked/expired.
     """
     cached_token = _read_cached_user_token(cfg)
     if cached_token:
         return cached_token
     # Cached access token expired — try to renew via the refresh token chain
     if get_user_refresh_token(cfg):
-        refreshed = refresh_user_token(cfg)
+        refreshed = _refresh_locked(cfg)
         if refreshed:
             return refreshed
         # Refresh chain is dead — clear stale caches
@@ -338,28 +441,18 @@ def _decode_jwt_expiry(token: str) -> int:
         return 0
 
 
-def set_user_token(
-    cfg: CountryConfig,
-    user_token: str,
-    refresh_token: str | None = None,
-) -> dict[str, Any]:
-    """Set the user credentials by validating and caching them.
+def _validate_user_token(
+    cfg: CountryConfig, user_token: str, guest_token: str
+) -> tuple[str, dict[str, Any]]:
+    """Validate an access token via an authenticated API call.
 
-    The user provides the values of TWO cookies from their browser
-    (after logging in at bunnings.com.au):
-      - ``UserAuthentication``        → user_token (10-min access JWT)
-      - ``UserAuthenticationRefresh`` → refresh_token (rotating, long-lived)
+    Returns ``("ok"|"auth_error"|"other_error"|"network_error", payload)``.
 
-    The refresh token enables automatic, indefinite renewal via the
-    Bunnings IdentityServer (see ``refresh_user_token``). Without it the
-    session dies after ~10 minutes.
+    Validation uses the wishlist endpoint: ``/apis/auth/session`` returns 404
+    server-side (Cloudflare fingerprinting), while the wishlist call works from
+    urllib when GuestAuthentication + UserAuthentication are sent together.
     """
-    # Validate via the wishlist API — /apis/auth/session returns 404
-    # when called server-side (Cloudflare fingerprinting).
-    # The wishlist endpoint requires auth + guest token and is proven to
-    # work from urllib when both cookies are sent together.
     url = cfg.base_url + "/_apis/v1/customer-management/users/wishlist?sortOrder=default&fields=SLIM"
-    guest_token = get_guest_token(cfg)
     headers = {
         "Accept": "application/json",
         "Cache-Control": "no-cache",
@@ -377,29 +470,91 @@ def set_user_token(
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            payload = json.loads(resp.read().decode("utf-8", "replace"))
+            return "ok", json.loads(resp.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
-            return {"error": "Invalid or expired token", "logged_in": False, "country": cfg.label}
-        # Non-auth error (5xx etc.) — don't block caching; the token may
-        # still be valid and the auto-refresh will sort it out.
-        payload = {}
+            return "auth_error", {}
+        return "other_error", {}
     except (urllib.error.URLError, json.JSONDecodeError):
-        return {"error": "Could not validate token", "logged_in": False, "country": cfg.label}
+        return "network_error", {}
 
-    # Use real JWT expiry when available, otherwise 600s (10 minutes)
-    exp = _decode_jwt_expiry(user_token)
-    expires_in = max(60, exp - int(time.time())) if exp else 600
 
-    _write_cached_user_token(cfg, user_token, expires_in, refresh_token=refresh_token)
-
+def _wishlist_count(payload: dict[str, Any]) -> int:
     data = payload.get("data", payload) if isinstance(payload, dict) else {}
     wishlists = data.get("wishLists", []) if isinstance(data, dict) else []
+    return len(wishlists)
+
+
+def _expires_in_from(token: str, fallback: int = 600) -> int:
+    exp = _decode_jwt_expiry(token)
+    return max(60, exp - int(time.time())) if exp else fallback
+
+
+def set_user_token(
+    cfg: CountryConfig,
+    user_token: str,
+    refresh_token: str | None = None,
+) -> dict[str, Any]:
+    """Set the user credentials by validating and caching them.
+
+    The user provides the values of TWO cookies from their browser
+    (after logging in at bunnings.com.au):
+      - ``UserAuthentication``        → user_token (10-min access JWT)
+      - ``UserAuthenticationRefresh`` → refresh_token (rotating, long-lived)
+
+    If the access cookie has already expired but the refresh cookie is still
+    valid, the session is renewed on the spot (via the refresh grant) instead of
+    being rejected, so copying the cookies a few minutes late still works. The
+    refresh token enables automatic, indefinite renewal (see
+    ``refresh_user_token``); without it the session dies after ~10 minutes.
+    """
+    guest_token = get_guest_token(cfg)
+    status, payload = _validate_user_token(cfg, user_token, guest_token)
+    refreshed_on_login = False
+
+    if status == "auth_error":
+        # The access cookie is dead. If we were handed a refresh cookie, renew
+        # now rather than bouncing the user.
+        if not refresh_token:
+            return {"error": "Invalid or expired token", "logged_in": False, "country": cfg.label}
+        with _user_token_lock(cfg):
+            grant = _refresh_token_grant(cfg, refresh_token)
+            if not grant:
+                return {
+                    "error": "Access token expired and refresh token rejected",
+                    "logged_in": False,
+                    "country": cfg.label,
+                }
+            user_token = str(grant["access_token"])
+            refresh_token = str(grant.get("refresh_token") or refresh_token)
+            # Persist the rotated pair immediately — the refresh token is
+            # single-use, so the replacement must never be lost.
+            _write_cached_user_token(
+                cfg, user_token, _expires_in_from(user_token), refresh_token=refresh_token
+            )
+            status, payload = _validate_user_token(cfg, user_token, guest_token)
+            if status != "ok":
+                return {
+                    "error": "Refreshed token was rejected",
+                    "logged_in": False,
+                    "country": cfg.label,
+                }
+            refreshed_on_login = True
+    elif status == "network_error":
+        return {"error": "Could not validate token", "logged_in": False, "country": cfg.label}
+    # "other_error" (e.g. 5xx): the token may still be valid; cache it and let
+    # auto-refresh reconcile later.
+
+    expires_in = _expires_in_from(user_token)
+    with _user_token_lock(cfg):
+        _write_cached_user_token(cfg, user_token, expires_in, refresh_token=refresh_token)
+
     return {
         "logged_in": True,
-        "wishlists_visible": len(wishlists),
+        "wishlists_visible": _wishlist_count(payload),
         "refresh_token_saved": bool(refresh_token),
         "auto_renewal": bool(refresh_token),
+        "refreshed_on_login": refreshed_on_login,
         "token_expires_in_seconds": expires_in,
         "country": cfg.label,
     }
@@ -419,39 +574,7 @@ def refresh_user_token(cfg: CountryConfig) -> str | None:
 
     Returns the new access token, or None if the refresh chain is dead.
     """
-    refresh_token = get_user_refresh_token(cfg)
-    if not refresh_token:
-        return None
-
-    body = urllib.parse.urlencode({
-        "grant_type": "refresh_token",
-        "client_id": cfg.retail_token_client_id,  # "budp_user_au_code"
-        "refresh_token": refresh_token,
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        cfg.auth_base + "/connect/token",
-        data=body,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-            "User-Agent": DEFAULT_USER_AGENT,
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            payload = json.loads(resp.read().decode("utf-8", "replace"))
-    except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError):
-        return None
-
-    new_token = payload.get("access_token") or ""
-    new_refresh = payload.get("refresh_token") or ""
-    if not new_token:
-        return None
-
-    expires_in = int(payload.get("expires_in") or 600)
-    _write_cached_user_token(cfg, new_token, expires_in, refresh_token=new_refresh)
-    return new_token
+    return _refresh_locked(cfg, force=True)
 
 
 def try_refresh_user_token(cfg: CountryConfig, user_token: str | None = None) -> str | None:
