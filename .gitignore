@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+
+# Local secrets / test artifacts — never commit session tokens
+bunnings_cookies.json
+*.token
+.env

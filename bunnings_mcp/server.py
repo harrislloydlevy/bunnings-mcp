@@ -9,10 +9,10 @@ from fastmcp import FastMCP
 
 from .auth import (
     clear_user_token,
-    exchange_login_code,
-    generate_login_url,
     get_country_config,
     get_user_token,
+    refresh_user_token,
+    set_user_token,
 )
 from .client import (
     add_to_cart,
@@ -459,66 +459,67 @@ async def list_stores(
 async def login(
     country: str = "au",
 ) -> dict[str, Any]:
-    """Generate a login URL for Bunnings user authentication.
+    """Get instructions for logging in to Bunnings.
 
-    Returns a URL that the user can open in their browser to log in.
-    After logging in, the user will be redirected to a URL with an authorization code.
-    The user should copy that code and the code_verifier, then pass both to complete_login.
+    Bunnings uses Okta with mandatory MFA, so the server cannot log in on the
+    user's behalf. The user logs in via their normal browser, then provides the
+    session cookies. With the refresh cookie included, the session renews
+    automatically and indefinitely — one login lasts until the refresh token
+    chain is revoked (weeks/months).
 
     Args:
         country: Country code - "au" for Australia, "nz" for New Zealand
 
     Returns:
-        Login URL, code_verifier, and instructions for completing the login.
+        Step-by-step login instructions.
     """
     cfg = get_country_config(country)
-    result = generate_login_url(cfg)
     return {
         "country": cfg.label,
-        "login_url": result["auth_url"],
-        "code_verifier": result["code_verifier"],
         "instructions": (
-            "1. Open the login_url in your browser\n"
-            "2. Log in with your Bunnings account\n"
-            "3. After login, you will be redirected to a URL starting with "
-            f"{cfg.redirect_uri}\n"
-            "4. Copy the 'code' parameter from the redirect URL\n"
-            "5. Call complete_login with the code and the code_verifier from this response"
+            "1. Log in at https://www.bunnings.com.au (or bunnings.co.nz) in your browser.\n"
+            "   Tip: use a private/incognito window so the session chain is only used here.\n"
+            "2. Open DevTools (F12) → Application → Storage → Cookies → the bunnings domain.\n"
+            "3. Copy the value of the 'UserAuthentication' cookie.\n"
+            "4. Copy the value of the 'UserAuthenticationRefresh' cookie as well.\n"
+            "5. Call complete_login with both values.\n"
+            "   The refresh cookie enables automatic renewal — no repeated logins needed."
         ),
+        "cookie_names": ["UserAuthentication", "UserAuthenticationRefresh"],
     }
 
 
 @mcp.tool()
 async def complete_login(
-    code: str,
-    code_verifier: str,
+    user_token: str,
+    refresh_token: str | None = None,
     country: str = "au",
 ) -> dict[str, Any]:
-    """Complete the login process by exchanging the authorization code for a token.
+    """Complete login by providing the browser session cookies.
 
-    After calling login() and opening the URL in your browser, you will be redirected
-    with an authorization code. Pass that code and the code_verifier to this tool
-    to complete the login and cache the user token.
+    Validates the UserAuthentication cookie via an authenticated Bunnings API
+    call, caches it together with the UserAuthenticationRefresh cookie, and
+    enables automatic renewal via the Bunnings IdentityServer.
 
     Args:
-        code: The authorization code from the redirect URL
-        code_verifier: The PKCE code verifier from the login() call
+        user_token: Value of the 'UserAuthentication' cookie (a JWT, starts with 'eyJ')
+        refresh_token: Value of the 'UserAuthenticationRefresh' cookie (looks like 64 hex chars + '-1')
         country: Country code - "au" for Australia, "nz" for New Zealand
 
     Returns:
-        Login success status and token information.
+        Login success status. After this, the session should persist automatically.
     """
     cfg = get_country_config(country)
-    try:
-        result = exchange_login_code(cfg, code, code_verifier)
-        return {
-            "country": cfg.label,
-            "logged_in": True,
-            "expires_in": result["expires_in"],
-            "token_type": result["token_type"],
-        }
-    except RuntimeError as e:
-        return {"error": str(e), "country": cfg.label, "logged_in": False}
+    result = set_user_token(cfg, user_token, refresh_token=refresh_token)
+    if result.get("logged_in"):
+        warning = None
+        if not refresh_token:
+            warning = (
+                "No refresh_token provided — the session will expire in ~10 minutes. "
+                "Provide the UserAuthenticationRefresh cookie to enable automatic renewal."
+            )
+        return {**result, "warning": warning}
+    return result
 
 
 @mcp.tool()
@@ -542,19 +543,30 @@ async def logout(
 async def check_login_status(
     country: str = "au",
 ) -> dict[str, Any]:
-    """Check if there is a valid cached user token.
+    """Check login status, including whether auto-renewal is enabled.
 
     Args:
         country: Country code - "au" for Australia, "nz" for New Zealand
 
     Returns:
-        Login status and token availability.
+        Login status, refresh capability, and token availability.
     """
+    from .auth import get_user_refresh_token
+
     cfg = get_country_config(country)
     token = get_user_token(cfg)
+    has_refresh = bool(get_user_refresh_token(cfg))
     return {
         "country": cfg.label,
         "logged_in": token is not None,
+        "auto_renewal_enabled": has_refresh,
+        "note": (
+            "Session renews automatically via refresh token."
+            if has_refresh
+            else "No refresh token stored — session expires in ~10 minutes."
+            if token
+            else "Not logged in. Call login for instructions."
+        ),
     }
 
 

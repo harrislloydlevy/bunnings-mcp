@@ -79,11 +79,36 @@ docker run -p 8000:8000 bunnings-mcp
 
 Product search, details, pricing, stock, and store locations use a **guest token** that is automatically minted via Bunnings' public OAuth2 flow — no login required.
 
-Cart and shopping list tools require an **authenticated user token**. To get one:
+Cart and shopping list tools require an **authenticated user session**. Bunnings uses Okta with
+mandatory MFA, so the server cannot log in on your behalf — you log in once in your browser,
+then the server keeps the session alive **indefinitely** using the refresh token.
+
+### Setup (one-time)
+
 1. Log in to [bunnings.com.au](https://www.bunnings.com.au) or [bunnings.co.nz](https://www.bunnings.co.nz)
-2. Open browser DevTools → Network tab
-3. Find any `/_apis/` request and copy the `Authorization: Bearer <token>` value
-4. Pass that token as the `user_token` parameter
+   in a **private/incognito window** (so only the MCP owns the session chain — see note below).
+2. Open DevTools → Application → Storage → Cookies → the Bunnings domain.
+3. Copy **both** cookie values:
+   - `UserAuthentication` (a JWT, starts with `eyJ`)
+   - `UserAuthenticationRefresh` (looks like 64 hex chars + `-1`)
+4. Call the `login` tool for instructions, then `complete_login` with both values:
+   ```
+   complete_login(user_token="eyJ...", refresh_token="ABC123...-1")
+   ```
+5. Close the incognito window.
+
+That's it. The MCP caches the pair and **automatically renews** the 10-minute access token via the
+Bunnings IdentityServer's public OIDC `refresh_token` grant (client `budp_user_au_code`, no secret).
+The refresh token rotates on every use and the server persists the new one immediately, so the
+chain keeps going until the refresh token is revoked (typically weeks/months of idle-free use).
+
+Use `check_login_status` to see whether a session is active and auto-renewal is enabled.
+
+> **Note:** if you log in in your normal browser *and* give the same cookies to the MCP, both sides
+> will rotate the refresh token and fight over the chain (one side gets logged out). Use an
+> incognito window, or accept that re-login may occasionally be needed.
+
+Full auth details, findings, and failed approaches: [`BunningsAuth.md`](BunningsAuth.md).
 
 ## API Research
 

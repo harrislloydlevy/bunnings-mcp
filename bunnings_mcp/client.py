@@ -9,7 +9,7 @@ import urllib.request
 import uuid
 from typing import Any
 
-from .auth import get_guest_token, clear_token
+from .auth import get_guest_token, clear_token, try_refresh_user_token
 from .config import APIGEE_CLIENT_ID, DEFAULT_USER_AGENT, REQUEST_TIMEOUT, CountryConfig
 
 
@@ -37,11 +37,14 @@ def _api_headers(
     user_token: str | None = None,
 ) -> dict[str, str]:
     token = token or get_guest_token(cfg)
+    cookie = f"GuestAuthentication={token}"
+    if user_token:
+        cookie += f"; UserAuthentication={user_token}"
     headers = {
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-NZ,en-AU;q=0.9,en;q=0.8",
+        "Accept-Language": "en-AU,en;q=0.9",
         "Authorization": "Bearer " + (user_token or token),
-        "Cookie": "GuestAuthentication=" + token,
+        "Cookie": cookie,
         "Referer": _build_url(cfg, referer_path),
         "User-Agent": DEFAULT_USER_AGENT,
         "clientId": APIGEE_CLIENT_ID,
@@ -87,6 +90,10 @@ def api_request(
         if e.code in (401, 403) and retry_auth and not user_token:
             clear_token(cfg)
             return api_request(cfg, path, method, body, referer_path, user_token, retry_auth=False)
+        if e.code in (401, 403) and retry_auth and user_token:
+            new_token = try_refresh_user_token(cfg, user_token)
+            if new_token:
+                return api_request(cfg, path, method, body, referer_path, new_token, retry_auth=False)
         raise BunningsAPIError(
             f"HTTP {e.code} from {url}: {raw[:500]}",
             status_code=e.code,
@@ -313,38 +320,62 @@ def browse_category(cfg: CountryConfig, category: str, limit: int = 10) -> dict[
     return search_products(cfg, "", limit=limit, category_code=category_code, category_path=path.replace("/products/", "", 1))
 
 
-def get_cart(cfg: CountryConfig, user_token: str) -> dict[str, Any]:
+def get_cart(cfg: CountryConfig, user_token: str, cart_id: str | None = None) -> dict[str, Any]:
     """Get the current user's cart. Requires authenticated user token."""
-    return api_request(cfg, "/_apis/v1/basket", user_token=user_token)
+    if cart_id:
+        return api_request(cfg, f"/_apis/v1/carts/{cart_id}?fields=LITE", user_token=user_token)
+    # Try to get cart ID from the checkexp/baskets endpoint
+    result = api_request(cfg, "/_apis/chkexp/baskets", user_token=user_token)
+    if isinstance(result, dict) and result.get("cartId"):
+        return api_request(cfg, f"/_apis/v1/carts/{result['cartId']}?fields=LITE", user_token=user_token)
+    return result
 
 
-def add_to_cart(cfg: CountryConfig, user_token: str, item_number: str, quantity: int = 1) -> dict[str, Any]:
+def add_to_cart(cfg: CountryConfig, user_token: str, item_number: str, quantity: int = 1, cart_id: str | None = None) -> dict[str, Any]:
     """Add an item to the cart. Requires authenticated user token."""
+    if not cart_id:
+        cart_result = api_request(cfg, "/_apis/chkexp/baskets", user_token=user_token)
+        if isinstance(cart_result, dict) and cart_result.get("cartId"):
+            cart_id = cart_result["cartId"]
+        else:
+            return {"error": "Could not determine cart ID", "country": cfg.label}
     return api_request(
         cfg,
-        "/_apis/v1/basket/items",
+        f"/_apis/v1/carts/{cart_id}/items",
         method="POST",
         body={"items": [{"itemNumber": item_number, "quantity": quantity}]},
         user_token=user_token,
     )
 
 
-def update_cart_item(cfg: CountryConfig, user_token: str, item_number: str, quantity: int) -> dict[str, Any]:
+def update_cart_item(cfg: CountryConfig, user_token: str, item_number: str, quantity: int, cart_id: str | None = None) -> dict[str, Any]:
     """Update cart item quantity. Requires authenticated user token."""
+    if not cart_id:
+        cart_result = api_request(cfg, "/_apis/chkexp/baskets", user_token=user_token)
+        if isinstance(cart_result, dict) and cart_result.get("cartId"):
+            cart_id = cart_result["cartId"]
+        else:
+            return {"error": "Could not determine cart ID", "country": cfg.label}
     return api_request(
         cfg,
-        f"/_apis/v1/basket/items/{item_number}",
+        f"/_apis/v1/carts/{cart_id}/items/{item_number}",
         method="PUT",
         body={"quantity": quantity},
         user_token=user_token,
     )
 
 
-def remove_from_cart(cfg: CountryConfig, user_token: str, item_number: str) -> dict[str, Any]:
+def remove_from_cart(cfg: CountryConfig, user_token: str, item_number: str, cart_id: str | None = None) -> dict[str, Any]:
     """Remove an item from the cart. Requires authenticated user token."""
+    if not cart_id:
+        cart_result = api_request(cfg, "/_apis/chkexp/baskets", user_token=user_token)
+        if isinstance(cart_result, dict) and cart_result.get("cartId"):
+            cart_id = cart_result["cartId"]
+        else:
+            return {"error": "Could not determine cart ID", "country": cfg.label}
     return api_request(
         cfg,
-        f"/_apis/v1/basket/items/{item_number}",
+        f"/_apis/v1/carts/{cart_id}/items/{item_number}",
         method="DELETE",
         user_token=user_token,
     )
@@ -352,14 +383,18 @@ def remove_from_cart(cfg: CountryConfig, user_token: str, item_number: str) -> d
 
 def list_shopping_lists(cfg: CountryConfig, user_token: str) -> dict[str, Any]:
     """List user's shopping/project lists. Requires authenticated user token."""
-    return api_request(cfg, "/_apis/v1/projectlists", user_token=user_token)
+    return api_request(
+        cfg,
+        "/_apis/v1/customer-management/users/wishlist?sortOrder=default&fields=SLIM",
+        user_token=user_token,
+    )
 
 
 def create_shopping_list(cfg: CountryConfig, user_token: str, name: str) -> dict[str, Any]:
     """Create a new shopping/project list. Requires authenticated user token."""
     return api_request(
         cfg,
-        "/_apis/v1/projectlists",
+        "/_apis/v1/customer-management/users/wishlist",
         method="POST",
         body={"name": name},
         user_token=user_token,
@@ -368,7 +403,11 @@ def create_shopping_list(cfg: CountryConfig, user_token: str, name: str) -> dict
 
 def get_shopping_list(cfg: CountryConfig, user_token: str, list_id: str) -> dict[str, Any]:
     """Get a specific shopping/project list. Requires authenticated user token."""
-    return api_request(cfg, f"/_apis/v1/projectlists/{list_id}", user_token=user_token)
+    return api_request(
+        cfg,
+        f"/_apis/v1/customer-management/users/wishlist/{list_id}",
+        user_token=user_token,
+    )
 
 
 def add_to_shopping_list(
@@ -377,9 +416,19 @@ def add_to_shopping_list(
     """Add an item to a shopping/project list. Requires authenticated user token."""
     return api_request(
         cfg,
-        f"/_apis/v1/projectlists/{list_id}/items",
+        "/_apis/v1/customer-management/users/wishlist",
         method="POST",
-        body={"items": [{"itemNumber": item_number, "quantity": quantity}]},
+        body={
+            "code": item_number,
+            "list": "",
+            "name": "My Project List",
+            "productCategory": "",
+            "productName": "",
+            "productValue": 0,
+            "quantity": str(quantity),
+            "wishlistId": list_id,
+            "wishlistName": "My Project List",
+        },
         user_token=user_token,
     )
 
@@ -390,7 +439,7 @@ def remove_from_shopping_list(
     """Remove an item from a shopping/project list. Requires authenticated user token."""
     return api_request(
         cfg,
-        f"/_apis/v1/projectlists/{list_id}/items/{item_number}",
+        f"/_apis/v1/customer-management/users/wishlist/{list_id}/items/{item_number}",
         method="DELETE",
         user_token=user_token,
     )
@@ -400,7 +449,7 @@ def delete_shopping_list(cfg: CountryConfig, user_token: str, list_id: str) -> d
     """Delete a shopping/project list. Requires authenticated user token."""
     return api_request(
         cfg,
-        f"/_apis/v1/projectlists/{list_id}",
+        f"/_apis/v1/customer-management/users/wishlist/{list_id}",
         method="DELETE",
         user_token=user_token,
     )
