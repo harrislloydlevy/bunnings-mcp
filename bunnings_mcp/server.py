@@ -645,7 +645,7 @@ async def add_to_cart(
 
 @mcp.tool()
 async def update_cart_item(
-    item_number: str,
+    entry_number: str,
     quantity: int,
     country: str = "au",
     user_token: str | None = None,
@@ -655,7 +655,7 @@ async def update_cart_item(
     Requires authentication. Use the login tool first, or provide a user_token.
 
     Args:
-        item_number: Product item number/SKU to update
+        entry_number: The cart entry number (see the 'entryNumber' field from get_cart)
         quantity: New quantity (0 to remove)
         country: Country code - "au" for Australia, "nz" for New Zealand
         user_token: Optional bearer token (uses cached token if not provided)
@@ -668,7 +668,7 @@ async def update_cart_item(
     if not token:
         return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
     try:
-        cart = update_cart_item(cfg, token, item_number, quantity)
+        cart = update_cart_item(cfg, token, entry_number, quantity)
         return {"country": cfg.label, "cart": cart}
     except BunningsAPIError as e:
         return {"error": str(e), "country": cfg.label}
@@ -676,7 +676,7 @@ async def update_cart_item(
 
 @mcp.tool()
 async def remove_from_cart(
-    item_number: str,
+    entry_number: str,
     country: str = "au",
     user_token: str | None = None,
 ) -> dict[str, Any]:
@@ -685,7 +685,7 @@ async def remove_from_cart(
     Requires authentication. Use the login tool first, or provide a user_token.
 
     Args:
-        item_number: Product item number/SKU to remove
+        entry_number: The cart entry number (see the 'entryNumber' field from get_cart)
         country: Country code - "au" for Australia, "nz" for New Zealand
         user_token: Optional bearer token (uses cached token if not provided)
 
@@ -697,7 +697,7 @@ async def remove_from_cart(
     if not token:
         return {"error": "Not logged in. Call the login tool first to authenticate.", "country": cfg.label}
     try:
-        cart = remove_from_cart(cfg, token, item_number)
+        cart = remove_from_cart(cfg, token, entry_number)
         return {"country": cfg.label, "cart": cart}
     except BunningsAPIError as e:
         return {"error": str(e), "country": cfg.label}

@@ -320,62 +320,98 @@ def browse_category(cfg: CountryConfig, category: str, limit: int = 10) -> dict[
     return search_products(cfg, "", limit=limit, category_code=category_code, category_path=path.replace("/products/", "", 1))
 
 
+def _resolve_cart_id(
+    cfg: CountryConfig, user_token: str, cart_id: str | None = None
+) -> str | None:
+    """Resolve the current cart ID.
+
+    The cart ID is returned by ``POST /_apis/v1/carts`` (the ``data.code``
+    field). ``/_apis/chkexp/baskets`` is NOT the cart and has no ID.
+    """
+    if cart_id:
+        return str(cart_id)
+    result = api_request(
+        cfg,
+        "/_apis/v1/carts?oldCartId=&fields=LITE&cartCreate=false",
+        method="POST",
+        user_token=user_token,
+    )
+    data = result.get("data", result) if isinstance(result, dict) else {}
+    code = data.get("code") if isinstance(data, dict) else None
+    return str(code) if code else None
+
+
 def get_cart(cfg: CountryConfig, user_token: str, cart_id: str | None = None) -> dict[str, Any]:
     """Get the current user's cart. Requires authenticated user token."""
     if cart_id:
         return api_request(cfg, f"/_apis/v1/carts/{cart_id}?fields=LITE", user_token=user_token)
-    # Try to get cart ID from the checkexp/baskets endpoint
-    result = api_request(cfg, "/_apis/chkexp/baskets", user_token=user_token)
-    if isinstance(result, dict) and result.get("cartId"):
-        return api_request(cfg, f"/_apis/v1/carts/{result['cartId']}?fields=LITE", user_token=user_token)
-    return result
-
-
-def add_to_cart(cfg: CountryConfig, user_token: str, item_number: str, quantity: int = 1, cart_id: str | None = None) -> dict[str, Any]:
-    """Add an item to the cart. Requires authenticated user token."""
-    if not cart_id:
-        cart_result = api_request(cfg, "/_apis/chkexp/baskets", user_token=user_token)
-        if isinstance(cart_result, dict) and cart_result.get("cartId"):
-            cart_id = cart_result["cartId"]
-        else:
-            return {"error": "Could not determine cart ID", "country": cfg.label}
+    # POST (not GET) creates/returns the cart; the ID is in data.code
     return api_request(
         cfg,
-        f"/_apis/v1/carts/{cart_id}/items",
+        "/_apis/v1/carts?oldCartId=&fields=LITE&cartCreate=false",
         method="POST",
-        body={"items": [{"itemNumber": item_number, "quantity": quantity}]},
         user_token=user_token,
     )
 
 
-def update_cart_item(cfg: CountryConfig, user_token: str, item_number: str, quantity: int, cart_id: str | None = None) -> dict[str, Any]:
-    """Update cart item quantity. Requires authenticated user token."""
-    if not cart_id:
-        cart_result = api_request(cfg, "/_apis/chkexp/baskets", user_token=user_token)
-        if isinstance(cart_result, dict) and cart_result.get("cartId"):
-            cart_id = cart_result["cartId"]
-        else:
-            return {"error": "Could not determine cart ID", "country": cfg.label}
+def add_to_cart(
+    cfg: CountryConfig,
+    user_token: str,
+    item_number: str,
+    quantity: int = 1,
+    cart_id: str | None = None,
+) -> dict[str, Any]:
+    """Add an item to the cart. Requires authenticated user token."""
+    cid = _resolve_cart_id(cfg, user_token, cart_id)
+    if not cid:
+        return {"error": "Could not determine cart ID", "country": cfg.label}
+    path = (
+        f"/_apis/v1/carts/{cid}/entries"
+        f"?code={urllib.parse.quote(str(item_number))}&qty={int(quantity)}"
+        f"&fields=LITE&validateStock=false&isMarketLink=false"
+    )
+    return api_request(cfg, path, method="POST", user_token=user_token)
+
+
+def update_cart_item(
+    cfg: CountryConfig,
+    user_token: str,
+    entry_number: str | int,
+    quantity: int,
+    cart_id: str | None = None,
+) -> dict[str, Any]:
+    """Update a cart entry's quantity by its entryNumber. Requires user token.
+
+    Note: this takes the cart *entryNumber* (position in the cart), not the SKU.
+    """
+    cid = _resolve_cart_id(cfg, user_token, cart_id)
+    if not cid:
+        return {"error": "Could not determine cart ID", "country": cfg.label}
     return api_request(
         cfg,
-        f"/_apis/v1/carts/{cart_id}/items/{item_number}",
-        method="PUT",
-        body={"quantity": quantity},
+        f"/_apis/v1/carts/{cid}/entries/{entry_number}",
+        method="PATCH",
+        body={"quantity": int(quantity)},
         user_token=user_token,
     )
 
 
-def remove_from_cart(cfg: CountryConfig, user_token: str, item_number: str, cart_id: str | None = None) -> dict[str, Any]:
-    """Remove an item from the cart. Requires authenticated user token."""
-    if not cart_id:
-        cart_result = api_request(cfg, "/_apis/chkexp/baskets", user_token=user_token)
-        if isinstance(cart_result, dict) and cart_result.get("cartId"):
-            cart_id = cart_result["cartId"]
-        else:
-            return {"error": "Could not determine cart ID", "country": cfg.label}
+def remove_from_cart(
+    cfg: CountryConfig,
+    user_token: str,
+    entry_number: str | int,
+    cart_id: str | None = None,
+) -> dict[str, Any]:
+    """Remove a cart entry by its entryNumber. Requires authenticated user token.
+
+    Note: this takes the cart *entryNumber* (position in the cart), not the SKU.
+    """
+    cid = _resolve_cart_id(cfg, user_token, cart_id)
+    if not cid:
+        return {"error": "Could not determine cart ID", "country": cfg.label}
     return api_request(
         cfg,
-        f"/_apis/v1/carts/{cart_id}/items/{item_number}",
+        f"/_apis/v1/carts/{cid}/entries/{entry_number}",
         method="DELETE",
         user_token=user_token,
     )
