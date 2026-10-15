@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""Offline regression tests for the MCP server tools.
+"""Offline tests that drive the real MCP server through the FastMCP client.
 
-Guards against a subtle bug: ``@mcp.tool()`` rebinds the decorated name in the
-``bunnings_mcp.server`` module. A tool that calls an imported client function of
-the *same* name therefore captures the tool itself and returns a coroutine
-instead of the client result. The server avoids this by calling
-``client.<fn>(...)``.
+These call the tools over the in-memory transport — exactly the path an MCP
+client uses — so they catch bugs that importing functions directly would miss.
+In particular, ``@mcp.tool()`` rebinds the decorated name in
+``bunnings_mcp.server``; a tool calling an imported client function of the same
+name would capture the tool itself and return a coroutine, which then fails to
+serialise here.
 
-The client layer is patched, so this test uses no network and no credentials.
+The client layer is patched, so no network and no credentials are used.
 
     python3 test_server_tools.py
 """
 from __future__ import annotations
 
 import asyncio
-import inspect
 from typing import Any
+
+from fastmcp import Client
 
 import bunnings_mcp.server as server
 
@@ -52,6 +54,30 @@ CLIENT_RETURNS: dict[str, Any] = {
     "add_shopping_list_to_cart": {"allAddedToCart": True},
 }
 
+# tool name -> (arguments, expected client function that must be called)
+CASES: list[tuple[str, dict[str, Any], str]] = [
+    ("search_products", {"query": "drill"}, "search_products"),
+    ("get_product_price", {"sku": "1"}, "get_product_price"),
+    ("get_product_location", {"sku": "1"}, "get_product_location"),
+    ("browse_category", {"category": "tools"}, "browse_category"),
+    ("list_stores", {}, "list_stores"),
+    ("get_cart", {}, "get_cart"),
+    ("add_to_cart", {"item_number": "1"}, "add_to_cart"),
+    ("update_cart_item", {"entry_number": "1", "quantity": 2}, "update_cart_item"),
+    ("remove_from_cart", {"entry_number": "1"}, "remove_from_cart"),
+    ("list_shopping_lists", {}, "list_shopping_lists"),
+    ("create_shopping_list", {"name": "n"}, "create_shopping_list"),
+    ("get_shopping_list", {"list_id": "L1"}, "get_shopping_list"),
+    ("add_to_shopping_list", {"list_id": "L1", "item_number": "S1"}, "add_to_shopping_list"),
+    ("remove_from_shopping_list", {"list_id": "L1", "item_number": "S1"}, "remove_from_shopping_list"),
+    ("delete_shopping_list", {"list_id": "L1"}, "delete_shopping_list"),
+    ("rename_shopping_list", {"list_id": "L1", "name": "n2"}, "rename_shopping_list"),
+    ("update_shopping_list_item", {"list_id": "L1", "quantity": 3, "item_number": "S1"}, "update_shopping_list_item"),
+    ("move_shopping_list_items", {"from_list_id": "L1", "to_list_id": "L2", "item_numbers": ["S1"]}, "move_shopping_list_items"),
+    ("set_active_shopping_list", {"list_id": "L1"}, "set_active_shopping_list"),
+    ("add_shopping_list_to_cart", {"list_id": "L1"}, "add_shopping_list_to_cart"),
+]
+
 
 def patch_client() -> dict[str, Any]:
     """Replace every client function with a recorder; return the call log."""
@@ -74,55 +100,23 @@ async def run_all() -> list[tuple[str, bool, str]]:
     calls = patch_client()
     results: list[tuple[str, bool, str]] = []
 
-    async def check(name: str, coro, expect_client: str | None = None) -> None:
-        try:
-            out = await coro
-        except Exception as e:  # noqa: BLE001
-            results.append((name, False, f"raised {type(e).__name__}: {e}"))
-            return
-        if inspect.iscoroutine(out):
-            results.append((name, False, "returned a coroutine (name shadowing!)"))
-            return
-        if not isinstance(out, dict):
-            results.append((name, False, f"expected dict, got {type(out).__name__}"))
-            return
-        if expect_client and expect_client not in calls:
-            results.append((name, False, f"never called client.{expect_client}"))
-            return
-        results.append((name, True, ""))
-
-    await check("search_products", server.search_products("drill"), "search_products")
-    await check("get_product_price", server.get_product_price("1"), "get_product_price")
-    await check("get_product_location", server.get_product_location("1"), "get_product_location")
-    await check("browse_category", server.browse_category("tools"), "browse_category")
-    await check("list_stores", server.list_stores(), "list_stores")
-    await check("get_cart", server.get_cart(), "get_cart")
-    await check("add_to_cart", server.add_to_cart("1"), "add_to_cart")
-    await check("update_cart_item", server.update_cart_item("1", 2), "update_cart_item")
-    await check("remove_from_cart", server.remove_from_cart("1"), "remove_from_cart")
-    await check("list_shopping_lists", server.list_shopping_lists(), "list_shopping_lists")
-    await check("create_shopping_list", server.create_shopping_list("n"), "create_shopping_list")
-    await check("get_shopping_list", server.get_shopping_list("L1"), "get_shopping_list")
-    await check("add_to_shopping_list", server.add_to_shopping_list("L1", "S1"), "add_to_shopping_list")
-    await check(
-        "remove_from_shopping_list",
-        server.remove_from_shopping_list("L1", item_number="S1"),
-        "remove_from_shopping_list",
-    )
-    await check("delete_shopping_list", server.delete_shopping_list("L1"), "delete_shopping_list")
-    await check("rename_shopping_list", server.rename_shopping_list("L1", "n2"), "rename_shopping_list")
-    await check(
-        "update_shopping_list_item",
-        server.update_shopping_list_item("L1", 3, item_number="S1"),
-        "update_shopping_list_item",
-    )
-    await check(
-        "move_shopping_list_items",
-        server.move_shopping_list_items("L1", "L2", item_numbers=["S1"]),
-        "move_shopping_list_items",
-    )
-    await check("set_active_shopping_list", server.set_active_shopping_list("L1"), "set_active_shopping_list")
-    await check("add_shopping_list_to_cart", server.add_shopping_list_to_cart("L1"), "add_shopping_list_to_cart")
+    async with Client(server.mcp) as client:
+        for tool, args, expect_client in CASES:
+            try:
+                res = await client.call_tool(tool, args)
+            except Exception as e:  # noqa: BLE001
+                results.append((tool, False, f"call failed: {type(e).__name__}: {e}"))
+                continue
+            if res.is_error:
+                results.append((tool, False, f"tool error: {res.data}"))
+                continue
+            if not isinstance(res.data, dict):
+                results.append((tool, False, f"expected dict, got {type(res.data).__name__}"))
+                continue
+            if expect_client not in calls:
+                results.append((tool, False, f"never called client.{expect_client}"))
+                continue
+            results.append((tool, True, ""))
     return results
 
 
@@ -132,7 +126,7 @@ def main() -> int:
         print(f"  {'PASS' if ok else 'FAIL'}  {name}{'  -- ' + detail if detail else ''}")
     failed = [name for name, ok, _ in results if not ok]
     print()
-    print(f"{len(results) - len(failed)}/{len(results)} tools returned data")
+    print(f"{len(results) - len(failed)}/{len(results)} tools returned data via the MCP client")
     return 1 if failed else 0
 
 

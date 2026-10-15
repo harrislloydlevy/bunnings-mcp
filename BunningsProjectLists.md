@@ -140,12 +140,13 @@ replaces `{wishlistId}` with `newListId` (the destination) and posts
 ## How this was verified
 
 Live probe scripts (throwaway, in `/tmp/opencode/`) drove the real API with a valid
-session, then an end-to-end test drove the **MCP server tools** themselves: created
-throwaway lists, added/removed/renamed/moved items, changed quantities, set active,
-added a list to the cart, and deleted the lists. All test lists and the injected cart
-entry were removed afterwards.
+session, then an end-to-end test drove the **MCP server through its FastMCP client**
+(the same path an MCP consumer uses): created throwaway lists, added/removed/renamed/
+moved items, changed quantities, set active, added a list to the cart, and deleted the
+lists. All test lists and the injected cart entry were removed afterwards.
 
-> Implementation note: `@mcp.tool()` rebinds the decorated name in `bunnings_mcp.server`,
-> so a tool must **not** call an imported client function of the same name (it would
-> capture the tool itself and return a coroutine). The server imports the client module
-> and calls `client.<fn>(...)`.
+`test_server_tools.py` is an offline regression test that also calls the tools through
+the MCP client. It exists because `@mcp.tool()` rebinds the decorated name in
+`bunnings_mcp.server`, so a tool that calls an imported client function of the same name
+captures the tool itself and returns a coroutine (which then fails to serialise). The
+server avoids this by calling `client.<fn>(...)`.
